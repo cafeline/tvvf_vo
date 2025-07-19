@@ -1,0 +1,46 @@
+# TVVF-VO ROS2ノード設定パラメータ
+# Time-Varying Vector Field + Velocity Obstacles 統合システム
+
+/**:
+  ros__parameters:
+    # TVVF関連パラメータ
+    k_attraction: 1.2          # 引力場強度
+    k_repulsion: 2.5           # 斥力場強度
+    influence_radius: 3.0      # 障害物影響半径 [m]
+
+    # VO関連パラメータ
+    time_horizon: 3.0          # VO時間ホライズン [s]
+    safety_margin: 0.25        # 安全マージン [m]
+    vo_resolution: 0.15        # VO速度空間解像度 [m/s]
+
+    # ロボット関連パラメータ
+    max_velocity: 1.5          # 最大速度 [m/s]
+    max_acceleration: 1.0      # 最大加速度 [m/s²]
+    robot_radius: 0.3          # ロボット半径 [m]
+
+    # 制御関連パラメータ
+    goal_tolerance: 0.15       # 目標許容誤差 [m]
+    max_computation_time: 0.05 # 最大計算時間 [s]
+
+    # 最適化重み
+    direction_weight: 1.0      # 方向類似性重み
+    safety_weight: 2.0         # 安全性重み
+    efficiency_weight: 0.5     # エネルギー効率重み
+
+    # フレーム設定
+    # base_frame: "base_link"    # ロボットベースフレーム
+    # global_frame: "map"        # グローバルフレーム
+
+    # デバッグ・可視化
+    enable_visualization: true # 可視化マーカー有効
+    enable_debug_output: false # デバッグ出力有効
+
+    # 障害物検出パラメータ
+    min_obstacle_distance: 0.3    # 最小障害物検出距離 [m]
+    max_obstacle_distance: 4.0    # 最大障害物検出距離 [m]
+    cluster_threshold: 0.3        # クラスタリング閾値 [m]
+    min_cluster_points: 3         # 最小クラスタポイント数
+
+    # 数値安定性パラメータ
+    min_distance: 1e-6         # 最小距離（ゼロ除算回避）
+    max_force: 10.0            # 最大力制限
