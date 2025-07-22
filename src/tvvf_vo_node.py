@@ -135,7 +135,7 @@ class TVVFVONode(Node):
                 # デバッグ・可視化
         self.declare_parameter('enable_visualization', True,
                              ParameterDescriptor(description='Enable visualization markers'))
-        self.declare_parameter('enable_debug_output', False,
+        self.declare_parameter('enable_debug_output', True,  # ← Trueに変更
                              ParameterDescriptor(description='Enable debug output'))
         self.declare_parameter('enable_laser_viz', True,
                              ParameterDescriptor(description='Enable laser points visualization'))
@@ -317,7 +317,7 @@ class TVVFVONode(Node):
             self.get_logger().error(f'Laser callback error: {e}')
 
     def _detect_obstacles_from_laser(self, laser_msg: LaserScan) -> List[DynamicObstacle]:
-        """レーザースキャンから障害物検出（TF2を使用した適切な変換）"""
+        """レーザースキャンから障害物検出（修正版）"""
         obstacles = []
 
         # クラスタリングによる障害物検出
@@ -328,20 +328,37 @@ class TVVFVONode(Node):
         valid_points = []
 
         # レーザーフレームとグローバルフレームの取得
-        laser_frame = laser_msg.header.frame_id if laser_msg.header.frame_id else self.get_parameter('laser_frame').value
+        laser_frame = laser_msg.header.frame_id
         global_frame = self.get_parameter('global_frame').value
 
-        # TF変換の準備
+        # デバッグ情報を追加
+        self.get_logger().debug(f'Laser frame: {laser_frame}, Global frame: {global_frame}')
+
+        # TF変換の準備（レーザーメッセージのタイムスタンプを使用）
         try:
-            # レーザーフレームからグローバルフレームへの変換を取得
+            # レーザーメッセージのタイムスタンプを使用
+            laser_time = rclpy.time.Time.from_msg(laser_msg.header.stamp)
+            
+            # TF変換の可用性をチェック
+            if not self.tf_buffer.can_transform(global_frame, laser_frame, laser_time):
+                self.get_logger().warn(f'TF transform not available: {global_frame} -> {laser_frame}')
+                return obstacles
+                
             transform_stamped = self.tf_buffer.lookup_transform(
-                global_frame, laser_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+                global_frame, laser_frame, laser_time,
+                timeout=rclpy.duration.Duration(seconds=0.1)
             )
+            
+            self.get_logger().debug(f'TF transform successful: {len(laser_msg.ranges)} points')
+            
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
-            self.get_logger().debug(f'TF lookup failed for laser: {e}')
+            self.get_logger().warn(f'TF lookup failed for laser: {e}')
             return obstacles
 
+        # 有効なポイント数をカウント
+        valid_count = 0
+        
         for i, distance in enumerate(laser_msg.ranges):
             if min_distance < distance < max_distance and not math.isinf(distance) and not math.isnan(distance):
                 angle = laser_msg.angle_min + i * laser_msg.angle_increment
@@ -366,10 +383,13 @@ class TVVFVONode(Node):
                     )
 
                     valid_points.append((global_point.point.x, global_point.point.y))
+                    valid_count += 1
 
                 except Exception as e:
                     self.get_logger().debug(f'Point transform failed: {e}')
                     continue
+
+        self.get_logger().debug(f'Valid points: {valid_count}/{len(laser_msg.ranges)}')
 
         # 簡易クラスタリング
         clusters = self._cluster_points(valid_points, cluster_threshold)
@@ -393,6 +413,7 @@ class TVVFVONode(Node):
                     radius=min(radius, 0.5)  # 最大半径制限
                 ))
 
+        self.get_logger().debug(f'Detected obstacles: {len(obstacles)}')
         return obstacles
 
     def _cluster_points(self, points: List[tuple], threshold: float) -> List[List[tuple]]:
@@ -739,18 +760,26 @@ class TVVFVONode(Node):
         return marker
 
     def _publish_laser_points_visualization(self, laser_msg: LaserScan):
-        """レーザーポイントの可視化（デバッグ用）"""
+        """レーザーポイントの可視化（修正版）"""
         try:
             marker_array = MarkerArray()
 
             # レーザーフレームとグローバルフレームの取得
-            laser_frame = laser_msg.header.frame_id if laser_msg.header.frame_id else self.get_parameter('laser_frame').value
+            laser_frame = laser_msg.header.frame_id
             global_frame = self.get_parameter('global_frame').value
 
-            # TF変換の準備
+            # TF変換の準備（レーザーメッセージのタイムスタンプを使用）
             try:
+                laser_time = rclpy.time.Time.from_msg(laser_msg.header.stamp)
+                
+                # TF変換の可用性をチェック
+                if not self.tf_buffer.can_transform(global_frame, laser_frame, laser_time):
+                    self.get_logger().warn(f'TF transform not available for visualization: {global_frame} -> {laser_frame}')
+                    return
+                    
                 transform_stamped = self.tf_buffer.lookup_transform(
-                    global_frame, laser_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+                    global_frame, laser_frame, laser_time,
+                    timeout=rclpy.duration.Duration(seconds=0.1)
                 )
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException) as e:
@@ -773,6 +802,7 @@ class TVVFVONode(Node):
             points_marker.lifetime = rclpy.duration.Duration(seconds=0.1).to_msg()
 
             # レーザーポイントを変換してマーカーに追加
+            point_count = 0
             for i, distance in enumerate(laser_msg.ranges):
                 if 0.1 < distance < 10.0 and not math.isinf(distance) and not math.isnan(distance):
                     angle = laser_msg.angle_min + i * laser_msg.angle_increment
@@ -800,12 +830,15 @@ class TVVFVONode(Node):
                         point.y = global_point.point.y
                         point.z = 0.0
                         points_marker.points.append(point)
+                        point_count += 1
 
                     except Exception as e:
                         continue
 
-            marker_array.markers.append(points_marker)
-            self.laser_points_pub.publish(marker_array)
+            if point_count > 0:
+                marker_array.markers.append(points_marker)
+                self.laser_points_pub.publish(marker_array)
+                self.get_logger().debug(f'Published {point_count} laser points')
 
         except Exception as e:
             self.get_logger().error(f'Laser visualization error: {e}')
