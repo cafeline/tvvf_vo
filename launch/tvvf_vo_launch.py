@@ -29,11 +29,7 @@ def generate_launch_description():
         description='可視化マーカーを有効にするかどうか'
     )
 
-    declare_enable_debug = DeclareLaunchArgument(
-        'enable_debug',
-        default_value='false',
-        description='デバッグ出力を有効にするかどうか'
-    )
+
 
     declare_max_velocity = DeclareLaunchArgument(
         'max_velocity',
@@ -57,7 +53,6 @@ def generate_launch_description():
             LaunchConfiguration('config_file'),
             {
                 'enable_visualization': LaunchConfiguration('enable_visualization'),
-                'enable_debug_output': LaunchConfiguration('enable_debug'),
                 'max_velocity': LaunchConfiguration('max_velocity'),
                 'robot_radius': LaunchConfiguration('robot_radius'),
             }
@@ -75,7 +70,6 @@ def generate_launch_description():
     return LaunchDescription([
         declare_config_file,
         declare_enable_visualization,
-        declare_enable_debug,
         declare_max_velocity,
         declare_robot_radius,
         tvvf_vo_node,

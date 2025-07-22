@@ -60,7 +60,6 @@ class TVVFVONode(Node):
         # パブリッシャー
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.marker_pub = self.create_publisher(MarkerArray, 'tvvf_vo_markers', 10)
-        self.debug_pub = self.create_publisher(Marker, 'tvvf_vo_debug', 10)
         self.vector_field_pub = self.create_publisher(MarkerArray, 'tvvf_vo_vector_field', 10)
 
         # サブスクライバー
@@ -134,8 +133,6 @@ class TVVFVONode(Node):
                 # デバッグ・可視化
         self.declare_parameter('enable_visualization', True,
                              ParameterDescriptor(description='Enable visualization markers'))
-        self.declare_parameter('enable_debug_output', True,  # ← Trueに変更
-                             ParameterDescriptor(description='Enable debug output'))
 
         # ベクトル場可視化
         self.declare_parameter('enable_vector_field_viz', True,
@@ -147,15 +144,7 @@ class TVVFVONode(Node):
         self.declare_parameter('vector_scale_factor', 0.5,
                              ParameterDescriptor(description='Vector arrow scale factor'))
         
-        # 可視化高速化パラメータ
-        self.declare_parameter('viz_update_interval', 0.1,
-                             ParameterDescriptor(description='Visualization update interval [s]'))
-        self.declare_parameter('vector_field_update_interval', 0.5,
-                             ParameterDescriptor(description='Vector field update interval [s]'))
-        self.declare_parameter('max_vector_field_points', 100,
-                             ParameterDescriptor(description='Maximum vector field points'))
-        self.declare_parameter('max_obstacle_markers', 10,
-                             ParameterDescriptor(description='Maximum obstacle markers'))
+
 
     def _create_config_from_parameters(self) -> TVVFVOConfig:
         """ROS2パラメータからTVVFVOConfigを作成"""
@@ -483,9 +472,8 @@ class TVVFVONode(Node):
             # 可視化処理時間計測
             viz_start_time = time.time()
             
-            # デバッグ出力
-            if self.get_parameter('enable_debug_output').value:
-                self._print_debug_info(stats, distance_to_goal, tf_time, tvvf_time, cmd_time)
+            # デバッグ出力（常時実行）
+            self._print_debug_info(stats, distance_to_goal, tf_time, tvvf_time, cmd_time)
 
             # 可視化
             if self.get_parameter('enable_visualization').value:
@@ -779,7 +767,7 @@ class TVVFVONode(Node):
             self.get_logger().debug(f'TF status check error: {e}')
 
     def _publish_visualization(self):
-        """可視化マーカーの配信（高速化版）"""
+        """可視化マーカーの配信（ゴールポイントのみ）"""
         try:
             # 可視化頻度制御
             current_time = time.time()
@@ -791,62 +779,18 @@ class TVVFVONode(Node):
             marker_array = MarkerArray()
             marker_id = 0
 
-            # ロボット表示
-            if self.robot_state:
-                robot_marker = self._create_robot_marker(marker_id)
-                marker_array.markers.append(robot_marker)
-                marker_id += 1
-
-            # 目標表示
+            # 目標表示のみ
             if self.goal:
                 goal_marker = self._create_goal_marker(marker_id)
                 marker_array.markers.append(goal_marker)
                 marker_id += 1
-
-            # 障害物表示（最大10個まで制限）
-            obstacle_count = 0
-            for obstacle in self.obstacles:
-                if obstacle_count >= 10:  # 最大10個の障害物のみ表示
-                    break
-                obstacle_marker = self._create_obstacle_marker(obstacle, marker_id)
-                marker_array.markers.append(obstacle_marker)
-                marker_id += 1
-                obstacle_count += 1
 
             self.marker_pub.publish(marker_array)
 
         except Exception as e:
             self.get_logger().error(f'Visualization error: {e}')
 
-    def _create_robot_marker(self, marker_id: int) -> Marker:
-        """ロボットマーカー作成"""
-        marker = Marker()
-        marker.header.frame_id = self.get_parameter('global_frame').value
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.id = marker_id
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
 
-        marker.pose.position.x = self.robot_state.position.x
-        marker.pose.position.y = self.robot_state.position.y
-        marker.pose.position.z = 0.0
-
-        quat = euler2quat(0, 0, self.robot_state.orientation)
-        marker.pose.orientation.w = quat[0]
-        marker.pose.orientation.x = quat[1]
-        marker.pose.orientation.y = quat[2]
-        marker.pose.orientation.z = quat[3]
-
-        marker.scale.x = self.robot_state.radius * 2
-        marker.scale.y = self.robot_state.radius * 2
-        marker.scale.z = 0.1
-
-        marker.color.r = 0.0
-        marker.color.g = 0.0
-        marker.color.b = 1.0
-        marker.color.a = 0.8
-
-        return marker
 
     def _create_goal_marker(self, marker_id: int) -> Marker:
         """目標マーカー作成"""
@@ -872,29 +816,7 @@ class TVVFVONode(Node):
 
         return marker
 
-    def _create_obstacle_marker(self, obstacle: DynamicObstacle, marker_id: int) -> Marker:
-        """障害物マーカー作成"""
-        marker = Marker()
-        marker.header.frame_id = self.get_parameter('global_frame').value
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.id = marker_id
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
 
-        marker.pose.position.x = obstacle.position.x
-        marker.pose.position.y = obstacle.position.y
-        marker.pose.position.z = 0.0
-
-        marker.scale.x = obstacle.radius * 2
-        marker.scale.y = obstacle.radius * 2
-        marker.scale.z = 0.2
-
-        marker.color.r = 1.0
-        marker.color.g = 0.0
-        marker.color.b = 0.0
-        marker.color.a = 0.7
-
-        return marker
 
 
 def main(args=None):
