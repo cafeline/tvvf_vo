@@ -62,7 +62,6 @@ class TVVFVONode(Node):
         self.marker_pub = self.create_publisher(MarkerArray, 'tvvf_vo_markers', 10)
         self.debug_pub = self.create_publisher(Marker, 'tvvf_vo_debug', 10)
         self.vector_field_pub = self.create_publisher(MarkerArray, 'tvvf_vo_vector_field', 10)
-        self.laser_points_pub = self.create_publisher(MarkerArray, 'tvvf_vo_laser_points', 10)
 
         # サブスクライバー
         # rviz2のPublish Pointツール用
@@ -137,8 +136,6 @@ class TVVFVONode(Node):
                              ParameterDescriptor(description='Enable visualization markers'))
         self.declare_parameter('enable_debug_output', True,  # ← Trueに変更
                              ParameterDescriptor(description='Enable debug output'))
-        self.declare_parameter('enable_laser_viz', True,
-                             ParameterDescriptor(description='Enable laser points visualization'))
 
         # ベクトル場可視化
         self.declare_parameter('enable_vector_field_viz', True,
@@ -308,10 +305,6 @@ class TVVFVONode(Node):
         try:
             # 障害物検出
             self.obstacles = self._detect_obstacles_from_laser(msg)
-
-            # レーザーポイントの可視化
-            if self.get_parameter('enable_laser_viz').value:
-                self._publish_laser_points_visualization(msg)
 
         except Exception as e:
             self.get_logger().error(f'Laser callback error: {e}')
@@ -604,7 +597,7 @@ class TVVFVONode(Node):
         )
 
     def _publish_vector_field_visualization(self):
-        """ベクトル場の可視化マーカーの配信（高速化版）"""
+        """ベクトル場の可視化マーカーの配信（常時表示版）"""
         try:
             if self.robot_state is None or self.goal is None:
                 return
@@ -616,13 +609,6 @@ class TVVFVONode(Node):
             resolution = self.get_parameter('vector_field_resolution').value
             viz_range = self.get_parameter('vector_field_range').value
             scale_factor = self.get_parameter('vector_scale_factor').value
-
-            # 可視化頻度制御（毎回ではなく間隔を空ける）
-            current_time = time.time()
-            if hasattr(self, 'last_vector_field_time'):
-                if current_time - self.last_vector_field_time < 0.5:  # 0.5秒間隔
-                    return
-            self.last_vector_field_time = current_time
 
             # ロボット位置を中心としたグリッドを作成
             robot_x = self.robot_state.position.x
@@ -759,89 +745,7 @@ class TVVFVONode(Node):
 
         return marker
 
-    def _publish_laser_points_visualization(self, laser_msg: LaserScan):
-        """レーザーポイントの可視化（修正版）"""
-        try:
-            marker_array = MarkerArray()
 
-            # レーザーフレームとグローバルフレームの取得
-            laser_frame = laser_msg.header.frame_id
-            global_frame = self.get_parameter('global_frame').value
-
-            # TF変換の準備（レーザーメッセージのタイムスタンプを使用）
-            try:
-                laser_time = rclpy.time.Time.from_msg(laser_msg.header.stamp)
-                
-                # TF変換の可用性をチェック
-                if not self.tf_buffer.can_transform(global_frame, laser_frame, laser_time):
-                    self.get_logger().warn(f'TF transform not available for visualization: {global_frame} -> {laser_frame}')
-                    return
-                    
-                transform_stamped = self.tf_buffer.lookup_transform(
-                    global_frame, laser_frame, laser_time,
-                    timeout=rclpy.duration.Duration(seconds=0.1)
-                )
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                self.get_logger().debug(f'TF lookup failed for laser visualization: {e}')
-                return
-
-            # レーザーポイントのマーカー作成
-            points_marker = Marker()
-            points_marker.header.frame_id = global_frame
-            points_marker.header.stamp = laser_msg.header.stamp
-            points_marker.id = 0
-            points_marker.type = Marker.POINTS
-            points_marker.action = Marker.ADD
-            points_marker.scale.x = 0.05  # ポイントサイズ
-            points_marker.scale.y = 0.05
-            points_marker.color.r = 1.0
-            points_marker.color.g = 1.0
-            points_marker.color.b = 0.0  # 黄色
-            points_marker.color.a = 0.8
-            points_marker.lifetime = rclpy.duration.Duration(seconds=0.1).to_msg()
-
-            # レーザーポイントを変換してマーカーに追加
-            point_count = 0
-            for i, distance in enumerate(laser_msg.ranges):
-                if 0.1 < distance < 10.0 and not math.isinf(distance) and not math.isnan(distance):
-                    angle = laser_msg.angle_min + i * laser_msg.angle_increment
-
-                    # レーザーフレームでの位置
-                    x_laser = distance * math.cos(angle)
-                    y_laser = distance * math.sin(angle)
-
-                    try:
-                        # TF2を使ってグローバルフレームに変換
-                        laser_point = TfPointStamped()
-                        laser_point.header.frame_id = laser_frame
-                        laser_point.header.stamp = laser_msg.header.stamp
-                        laser_point.point.x = x_laser
-                        laser_point.point.y = y_laser
-                        laser_point.point.z = 0.0
-
-                        global_point = tf2_geometry_msgs.do_transform_point(
-                            laser_point, transform_stamped
-                        )
-
-                        # マーカーポイントに追加
-                        point = Point()
-                        point.x = global_point.point.x
-                        point.y = global_point.point.y
-                        point.z = 0.0
-                        points_marker.points.append(point)
-                        point_count += 1
-
-                    except Exception as e:
-                        continue
-
-            if point_count > 0:
-                marker_array.markers.append(points_marker)
-                self.laser_points_pub.publish(marker_array)
-                self.get_logger().debug(f'Published {point_count} laser points')
-
-        except Exception as e:
-            self.get_logger().error(f'Laser visualization error: {e}')
 
     def _check_tf_status(self):
         """TF状態を定期的にチェック（デバッグ用）"""
