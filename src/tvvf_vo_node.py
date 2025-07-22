@@ -121,7 +121,7 @@ class TVVFVONode(Node):
         # フレーム名
         self.declare_parameter('base_frame', 'base_footprint',
                              ParameterDescriptor(description='Robot base frame'))
-        self.declare_parameter('global_frame', 'odom',
+        self.declare_parameter('global_frame', 'map',
                              ParameterDescriptor(description='Global frame'))
         self.declare_parameter('laser_frame', 'lidar_link',
                              ParameterDescriptor(description='Laser scanner frame'))
@@ -149,6 +149,16 @@ class TVVFVONode(Node):
                              ParameterDescriptor(description='Vector field visualization range [m]'))
         self.declare_parameter('vector_scale_factor', 0.5,
                              ParameterDescriptor(description='Vector arrow scale factor'))
+        
+        # 可視化高速化パラメータ
+        self.declare_parameter('viz_update_interval', 0.1,
+                             ParameterDescriptor(description='Visualization update interval [s]'))
+        self.declare_parameter('vector_field_update_interval', 0.5,
+                             ParameterDescriptor(description='Vector field update interval [s]'))
+        self.declare_parameter('max_vector_field_points', 100,
+                             ParameterDescriptor(description='Maximum vector field points'))
+        self.declare_parameter('max_obstacle_markers', 10,
+                             ParameterDescriptor(description='Maximum obstacle markers'))
 
     def _create_config_from_parameters(self) -> TVVFVOConfig:
         """ROS2パラメータからTVVFVOConfigを作成"""
@@ -417,9 +427,14 @@ class TVVFVONode(Node):
 
     def control_loop(self):
         """メイン制御ループ"""
+        loop_start_time = time.time()  # 全体処理時間計測開始
+        
         try:
             # ロボット状態の更新（TFから取得）
+            tf_start_time = time.time()
             tf_robot_state = self._get_robot_pose_from_tf()
+            tf_time = (time.time() - tf_start_time) * 1000  # ms
+            
             if tf_robot_state is not None:
                 self.robot_state = tf_robot_state
 
@@ -436,20 +451,27 @@ class TVVFVONode(Node):
                 return
 
             # TVVF-VO制御更新
+            tvvf_start_time = time.time()
             control_output = self.controller.update(
                 self.robot_state, self.obstacles, self.goal
             )
+            tvvf_time = (time.time() - tvvf_start_time) * 1000  # ms
 
             # 制御コマンド発行
+            cmd_start_time = time.time()
             self._publish_control_command(control_output)
+            cmd_time = (time.time() - cmd_start_time) * 1000  # ms
 
             # 統計情報更新
             stats = self.controller.get_stats()
             self.stats_history.append(stats)
 
+            # 可視化処理時間計測
+            viz_start_time = time.time()
+            
             # デバッグ出力
             if self.get_parameter('enable_debug_output').value:
-                self._print_debug_info(stats, distance_to_goal)
+                self._print_debug_info(stats, distance_to_goal, tf_time, tvvf_time, cmd_time)
 
             # 可視化
             if self.get_parameter('enable_visualization').value:
@@ -458,6 +480,21 @@ class TVVFVONode(Node):
             # ベクトル場可視化
             if self.get_parameter('enable_vector_field_viz').value:
                 self._publish_vector_field_visualization()
+            
+            viz_time = (time.time() - viz_start_time) * 1000  # ms
+
+            # 全体処理時間
+            total_time = (time.time() - loop_start_time) * 1000  # ms
+            
+            # 処理時間のログ出力（常時出力）
+            self.get_logger().info(
+                f'TVVF-VO Processing Time: '
+                f'Total: {total_time:.1f}ms, '
+                f'TF: {tf_time:.1f}ms, '
+                f'TVVF: {tvvf_time:.1f}ms, '
+                f'Cmd: {cmd_time:.1f}ms, '
+                f'Viz: {viz_time:.1f}ms'
+            )
 
         except Exception as e:
             self.get_logger().error(f'Control loop error: {e}')
@@ -531,127 +568,24 @@ class TVVFVONode(Node):
         cmd_msg = Twist()
         self.cmd_vel_pub.publish(cmd_msg)
 
-    def _print_debug_info(self, stats: Dict, distance_to_goal: float):
-        """デバッグ情報の出力"""
+    def _print_debug_info(self, stats: Dict, distance_to_goal: float, 
+                         tf_time: float, tvvf_time: float, cmd_time: float):
+        """デバッグ情報の出力（処理時間詳細版）"""
         self.get_logger().info(
-            f'TVVF-VO Stats: '
-            f'Computation: {stats["computation_time"]:.1f}ms, '
+            f'TVVF-VO Debug: '
+            f'Core computation: {stats["computation_time"]:.1f}ms, '
+            f'TF lookup: {tf_time:.1f}ms, '
+            f'TVVF update: {tvvf_time:.1f}ms, '
+            f'Command publish: {cmd_time:.1f}ms, '
             f'VO cones: {stats["num_vo_cones"]}, '
             f'Safety margin: {stats["safety_margin"]:.2f}m, '
             f'Goal distance: {distance_to_goal:.2f}m'
         )
 
-    def _publish_visualization(self):
-        """可視化マーカーの配信"""
-        try:
-            marker_array = MarkerArray()
-            marker_id = 0
-
-            # ロボット表示
-            if self.robot_state:
-                robot_marker = self._create_robot_marker(marker_id)
-                marker_array.markers.append(robot_marker)
-                marker_id += 1
-
-            # 目標表示
-            if self.goal:
-                goal_marker = self._create_goal_marker(marker_id)
-                marker_array.markers.append(goal_marker)
-                marker_id += 1
-
-            # 障害物表示
-            for obstacle in self.obstacles:
-                obstacle_marker = self._create_obstacle_marker(obstacle, marker_id)
-                marker_array.markers.append(obstacle_marker)
-                marker_id += 1
-
-            self.marker_pub.publish(marker_array)
-
-        except Exception as e:
-            self.get_logger().error(f'Visualization error: {e}')
-
-    def _create_robot_marker(self, marker_id: int) -> Marker:
-        """ロボットマーカー作成"""
-        marker = Marker()
-        marker.header.frame_id = self.get_parameter('global_frame').value
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.id = marker_id
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
-
-        marker.pose.position.x = self.robot_state.position.x
-        marker.pose.position.y = self.robot_state.position.y
-        marker.pose.position.z = 0.0
-
-        quat = euler2quat(0, 0, self.robot_state.orientation)
-        marker.pose.orientation.w = quat[0]
-        marker.pose.orientation.x = quat[1]
-        marker.pose.orientation.y = quat[2]
-        marker.pose.orientation.z = quat[3]
-
-        marker.scale.x = self.robot_state.radius * 2
-        marker.scale.y = self.robot_state.radius * 2
-        marker.scale.z = 0.1
-
-        marker.color.r = 0.0
-        marker.color.g = 0.0
-        marker.color.b = 1.0
-        marker.color.a = 0.8
-
-        return marker
-
-    def _create_goal_marker(self, marker_id: int) -> Marker:
-        """目標マーカー作成"""
-        marker = Marker()
-        marker.header.frame_id = self.get_parameter('global_frame').value
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.id = marker_id
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
-
-        marker.pose.position.x = self.goal.position.x
-        marker.pose.position.y = self.goal.position.y
-        marker.pose.position.z = 0.0
-
-        marker.scale.x = self.goal.tolerance * 2
-        marker.scale.y = self.goal.tolerance * 2
-        marker.scale.z = 0.05
-
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 0.0
-        marker.color.a = 0.8
-
-        return marker
-
-    def _create_obstacle_marker(self, obstacle: DynamicObstacle, marker_id: int) -> Marker:
-        """障害物マーカー作成"""
-        marker = Marker()
-        marker.header.frame_id = self.get_parameter('global_frame').value
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.id = marker_id
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
-
-        marker.pose.position.x = obstacle.position.x
-        marker.pose.position.y = obstacle.position.y
-        marker.pose.position.z = 0.0
-
-        marker.scale.x = obstacle.radius * 2
-        marker.scale.y = obstacle.radius * 2
-        marker.scale.z = 0.2
-
-        marker.color.r = 1.0
-        marker.color.g = 0.0
-        marker.color.b = 0.0
-        marker.color.a = 0.7
-
-        return marker
-
     def _publish_vector_field_visualization(self):
-        """ベクトル場の可視化マーカーの配信"""
+        """ベクトル場の可視化マーカーの配信（高速化版）"""
         try:
-            if self.robot_state is None:
+            if self.robot_state is None or self.goal is None:
                 return
 
             marker_array = MarkerArray()
@@ -662,65 +596,104 @@ class TVVFVONode(Node):
             viz_range = self.get_parameter('vector_field_range').value
             scale_factor = self.get_parameter('vector_scale_factor').value
 
+            # 可視化頻度制御（毎回ではなく間隔を空ける）
+            current_time = time.time()
+            if hasattr(self, 'last_vector_field_time'):
+                if current_time - self.last_vector_field_time < 0.5:  # 0.5秒間隔
+                    return
+            self.last_vector_field_time = current_time
+
             # ロボット位置を中心としたグリッドを作成
             robot_x = self.robot_state.position.x
             robot_y = self.robot_state.position.y
 
-            # グリッドポイントを生成
+            # グリッドポイントを生成（解像度を上げて計算量を削減）
             num_points = int(viz_range * 2 / resolution) + 1
+            
+            # 計算量削減のため、グリッドポイント数を制限
+            max_points = 100  # 最大100ポイントに制限
+            if num_points * num_points > max_points:
+                # 解像度を動的に調整
+                resolution = math.sqrt((viz_range * 2) ** 2 / max_points)
+                num_points = int(viz_range * 2 / resolution) + 1
+
             start_x = robot_x - viz_range
             start_y = robot_y - viz_range
 
-            for i in range(num_points):
-                for j in range(num_points):
+            # ベクトル場計算の高速化
+            for i in range(0, num_points, 2):  # 2つおきにサンプリング
+                for j in range(0, num_points, 2):
                     sample_x = start_x + i * resolution
                     sample_y = start_y + j * resolution
 
-                    # サンプル点での仮想的なロボット状態を作成
-                    sample_position = Position(sample_x, sample_y)
-                    sample_robot_state = RobotState(
-                        position=sample_position,
-                        velocity=Velocity(0.0, 0.0),
-                        orientation=0.0,
-                        max_velocity=self.robot_state.max_velocity,
-                        max_acceleration=self.robot_state.max_acceleration,
-                        radius=self.robot_state.radius
+                    # 簡易ベクトル場計算（TVVF-VO制御器を使わない高速版）
+                    vector_x, vector_y = self._calculate_simple_vector_field(
+                        sample_x, sample_y, robot_x, robot_y
                     )
 
-                    # この点でのベクトル場を計算
-                    if self.goal is not None:
-                        try:
-                            # TVVF-VO制御器を使ってベクトル場を計算
-                            control_output = self.controller.update(
-                                sample_robot_state, self.obstacles, self.goal
-                            )
+                    # ベクトルの大きさ
+                    magnitude = math.sqrt(vector_x**2 + vector_y**2)
 
-                            vector_x = control_output.velocity_command.vx
-                            vector_y = control_output.velocity_command.vy
+                    # 小さすぎるベクトルはスキップ
+                    if magnitude < 0.01:
+                        continue
 
-                            # ベクトルの大きさ
-                            magnitude = math.sqrt(vector_x**2 + vector_y**2)
-
-                            # 小さすぎるベクトルはスキップ
-                            if magnitude < 0.01:
-                                continue
-
-                            # 矢印マーカーを作成
-                            arrow_marker = self._create_vector_arrow_marker(
-                                marker_id, sample_x, sample_y, vector_x, vector_y,
-                                magnitude, scale_factor
-                            )
-                            marker_array.markers.append(arrow_marker)
-                            marker_id += 1
-
-                        except Exception as e:
-                            # 個別の計算エラーは無視
-                            continue
+                    # 矢印マーカーを作成
+                    arrow_marker = self._create_vector_arrow_marker(
+                        marker_id, sample_x, sample_y, vector_x, vector_y,
+                        magnitude, scale_factor
+                    )
+                    marker_array.markers.append(arrow_marker)
+                    marker_id += 1
 
             self.vector_field_pub.publish(marker_array)
 
         except Exception as e:
             self.get_logger().error(f'Vector field visualization error: {e}')
+
+    def _calculate_simple_vector_field(self, sample_x: float, sample_y: float, 
+                                     robot_x: float, robot_y: float) -> tuple:
+        """簡易ベクトル場計算（高速版）"""
+        # 目標への引力
+        if self.goal is not None:
+            goal_x = self.goal.position.x
+            goal_y = self.goal.position.y
+            
+            # 目標への方向ベクトル
+            dx_goal = goal_x - sample_x
+            dy_goal = goal_y - sample_y
+            dist_goal = math.sqrt(dx_goal**2 + dy_goal**2)
+            
+            if dist_goal > 0.1:
+                # 引力（距離に反比例）
+                attraction_strength = 1.0 / (1.0 + dist_goal)
+                vector_x = dx_goal * attraction_strength
+                vector_y = dy_goal * attraction_strength
+            else:
+                vector_x = 0.0
+                vector_y = 0.0
+        else:
+            vector_x = 0.0
+            vector_y = 0.0
+
+        # 障害物からの斥力（簡易版）
+        for obstacle in self.obstacles:
+            obs_x = obstacle.position.x
+            obs_y = obstacle.position.y
+            
+            # 障害物への方向ベクトル
+            dx_obs = sample_x - obs_x
+            dy_obs = sample_y - obs_y
+            dist_obs = math.sqrt(dx_obs**2 + dy_obs**2)
+            
+            if dist_obs < obstacle.radius + 0.5:  # 影響範囲内
+                if dist_obs > 0.1:
+                    # 斥力（距離の逆数）
+                    repulsion_strength = 0.5 / (dist_obs + 0.1)
+                    vector_x += dx_obs * repulsion_strength
+                    vector_y += dy_obs * repulsion_strength
+
+        return vector_x, vector_y
 
     def _create_vector_arrow_marker(self, marker_id: int, x: float, y: float,
                                   vx: float, vy: float, magnitude: float,
@@ -867,6 +840,124 @@ class TVVFVONode(Node):
 
         except Exception as e:
             self.get_logger().debug(f'TF status check error: {e}')
+
+    def _publish_visualization(self):
+        """可視化マーカーの配信（高速化版）"""
+        try:
+            # 可視化頻度制御
+            current_time = time.time()
+            if hasattr(self, 'last_viz_time'):
+                if current_time - self.last_viz_time < 0.1:  # 0.1秒間隔
+                    return
+            self.last_viz_time = current_time
+
+            marker_array = MarkerArray()
+            marker_id = 0
+
+            # ロボット表示
+            if self.robot_state:
+                robot_marker = self._create_robot_marker(marker_id)
+                marker_array.markers.append(robot_marker)
+                marker_id += 1
+
+            # 目標表示
+            if self.goal:
+                goal_marker = self._create_goal_marker(marker_id)
+                marker_array.markers.append(goal_marker)
+                marker_id += 1
+
+            # 障害物表示（最大10個まで制限）
+            obstacle_count = 0
+            for obstacle in self.obstacles:
+                if obstacle_count >= 10:  # 最大10個の障害物のみ表示
+                    break
+                obstacle_marker = self._create_obstacle_marker(obstacle, marker_id)
+                marker_array.markers.append(obstacle_marker)
+                marker_id += 1
+                obstacle_count += 1
+
+            self.marker_pub.publish(marker_array)
+
+        except Exception as e:
+            self.get_logger().error(f'Visualization error: {e}')
+
+    def _create_robot_marker(self, marker_id: int) -> Marker:
+        """ロボットマーカー作成"""
+        marker = Marker()
+        marker.header.frame_id = self.get_parameter('global_frame').value
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.id = marker_id
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = self.robot_state.position.x
+        marker.pose.position.y = self.robot_state.position.y
+        marker.pose.position.z = 0.0
+
+        quat = euler2quat(0, 0, self.robot_state.orientation)
+        marker.pose.orientation.w = quat[0]
+        marker.pose.orientation.x = quat[1]
+        marker.pose.orientation.y = quat[2]
+        marker.pose.orientation.z = quat[3]
+
+        marker.scale.x = self.robot_state.radius * 2
+        marker.scale.y = self.robot_state.radius * 2
+        marker.scale.z = 0.1
+
+        marker.color.r = 0.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 0.8
+
+        return marker
+
+    def _create_goal_marker(self, marker_id: int) -> Marker:
+        """目標マーカー作成"""
+        marker = Marker()
+        marker.header.frame_id = self.get_parameter('global_frame').value
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.id = marker_id
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = self.goal.position.x
+        marker.pose.position.y = self.goal.position.y
+        marker.pose.position.z = 0.0
+
+        marker.scale.x = self.goal.tolerance * 2
+        marker.scale.y = self.goal.tolerance * 2
+        marker.scale.z = 0.05
+
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 0.8
+
+        return marker
+
+    def _create_obstacle_marker(self, obstacle: DynamicObstacle, marker_id: int) -> Marker:
+        """障害物マーカー作成"""
+        marker = Marker()
+        marker.header.frame_id = self.get_parameter('global_frame').value
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.id = marker_id
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = obstacle.position.x
+        marker.pose.position.y = obstacle.position.y
+        marker.pose.position.z = 0.0
+
+        marker.scale.x = obstacle.radius * 2
+        marker.scale.y = obstacle.radius * 2
+        marker.scale.z = 0.2
+
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 0.7
+
+        return marker
 
 
 def main(args=None):
