@@ -8,6 +8,8 @@ ROS2から独立したコアロジック
 import numpy as np
 import copy
 import time
+import heapq
+import math
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Union
 from enum import Enum
@@ -85,6 +87,23 @@ class Goal:
     tolerance: float = 0.1  # [m]
 
 @dataclass
+class PathPoint:
+    """経路上の点クラス"""
+    position: Position
+    cost: float = 0.0
+    
+@dataclass
+class Path:
+    """経路クラス"""
+    points: List[PathPoint] = field(default_factory=list)
+    total_cost: float = 0.0
+    
+    def add_point(self, position: Position, cost: float = 0.0):
+        """経路に点を追加"""
+        self.points.append(PathPoint(position, cost))
+        self.total_cost += cost
+
+@dataclass
 class ControlOutput:
     """制御出力クラス"""
     velocity_command: Velocity
@@ -103,6 +122,12 @@ class TVVFVOConfig:
     k_attraction: float = 1.0
     k_repulsion: float = 2.0
     influence_radius: float = 3.0
+
+    # A*経路統合関連
+    k_path_attraction: float = 2.0     # 経路追従の引力強度
+    path_influence_radius: float = 2.0  # 経路の影響半径
+    lookahead_distance: float = 1.5    # 先読み距離
+    path_smoothing_factor: float = 0.8  # 経路スムージング係数
 
     # VO関連
     time_horizon: float = 3.0
@@ -169,19 +194,27 @@ class TVVFGenerator:
         self.config = config
 
     def compute_vector(self, position: Position, time: float,
-                      goal: Goal, obstacles: List[DynamicObstacle]) -> np.ndarray:
-        """TVVF計算関数"""
-        # 1. 引力場計算
-        attractive_force = self._compute_attractive_force(position, goal)
+                      goal: Goal, obstacles: List[DynamicObstacle],
+                      planned_path: Optional[Path] = None) -> np.ndarray:
+        """TVVF計算関数（A*経路統合版）"""
+        
+        # 1. A*経路の存在チェック（必須）
+        if planned_path is None or not planned_path.points:
+            # A*経路がない場合はゼロベクトルを返す
+            return np.zeros(2)
+            
+        # A*経路追従ベクトル場を使用（必須）
+        path_force = self._compute_path_following_force(position, planned_path)
+        goal_force = self._compute_adaptive_goal_force(position, goal, planned_path)
 
-        # 2. 斥力場計算（時間依存）
+        # 2. 斥力場計算（時間依存・従来通り）
         repulsive_force = self._compute_repulsive_force(position, time, obstacles)
 
         # 3. 時間依存補正項
         time_correction = self._compute_time_correction(position, time, obstacles, goal)
 
-        # 4. 合成
-        total_force = attractive_force + repulsive_force + time_correction
+        # 4. 合成（A*経路を優先）
+        total_force = path_force + goal_force + repulsive_force + time_correction
 
         # 5. 数値安定性とクリッピング
         total_force = clip_magnitude(total_force, self.config.max_force)
@@ -292,6 +325,127 @@ class TVVFGenerator:
             correction += time_weight * time_correction
 
         return correction * 0.2
+    
+    def _compute_path_following_force(self, position: Position, 
+                                    planned_path: Path) -> np.ndarray:
+        """A*経路追従力計算"""
+        if not planned_path.points:
+            return np.zeros(2)
+        
+        # 1. 現在位置に最も近い経路点を見つける
+        closest_point_idx = self._find_closest_path_point(position, planned_path)
+        
+        # 2. 先読み距離分だけ前の点を目標とする
+        target_point_idx = self._find_lookahead_point(
+            position, planned_path, closest_point_idx
+        )
+        
+        if target_point_idx >= len(planned_path.points):
+            target_point_idx = len(planned_path.points) - 1
+        
+        target_position = planned_path.points[target_point_idx].position
+        
+        # 3. 目標点への方向ベクトル計算
+        direction_vector = target_position.to_array() - position.to_array()
+        distance = np.linalg.norm(direction_vector)
+        
+        if distance < self.config.min_distance:
+            return np.zeros(2)
+        
+        # 4. 経路からの横方向距離に基づく補正
+        cross_track_error = self._compute_cross_track_error(
+            position, planned_path, closest_point_idx
+        )
+        
+        # 5. 経路追従力の計算
+        # 前進成分（経路に沿った方向）
+        forward_force = self.config.k_path_attraction * safe_normalize(direction_vector)
+        
+        # 横方向補正成分（経路に戻る方向）
+        lateral_correction = -0.5 * self.config.k_path_attraction * cross_track_error
+        
+        return forward_force + lateral_correction
+    
+    def _compute_adaptive_goal_force(self, position: Position, goal: Goal, 
+                                   planned_path: Path) -> np.ndarray:
+        """経路考慮型ゴール引力計算"""
+        # 経路の最終点に近い場合のみゴール引力を適用
+        if not planned_path.points:
+            return self._compute_attractive_force(position, goal)
+        
+        final_path_point = planned_path.points[-1].position
+        distance_to_final = position.distance_to(final_path_point)
+        
+        # 経路終端付近でのみゴール引力を強化
+        if distance_to_final < self.config.lookahead_distance * 2:
+            goal_force = self._compute_attractive_force(position, goal)
+            # 距離に応じて重みを調整
+            weight = min(1.0, distance_to_final / self.config.lookahead_distance)
+            return goal_force * weight
+        else:
+            # 経路追従を優先
+            return np.zeros(2)
+    
+    def _find_closest_path_point(self, position: Position, 
+                               planned_path: Path) -> int:
+        """現在位置に最も近い経路点のインデックスを見つける"""
+        min_distance = float('inf')
+        closest_idx = 0
+        
+        for i, path_point in enumerate(planned_path.points):
+            distance = position.distance_to(path_point.position)
+            if distance < min_distance:
+                min_distance = distance
+                closest_idx = i
+        
+        return closest_idx
+    
+    def _find_lookahead_point(self, position: Position, planned_path: Path, 
+                            start_idx: int) -> int:
+        """先読み距離に基づく目標点インデックスを見つける"""
+        accumulated_distance = 0.0
+        current_pos = position
+        
+        for i in range(start_idx, len(planned_path.points)):
+            path_point = planned_path.points[i]
+            segment_distance = current_pos.distance_to(path_point.position)
+            accumulated_distance += segment_distance
+            
+            if accumulated_distance >= self.config.lookahead_distance:
+                return i
+            
+            current_pos = path_point.position
+        
+        # 経路終端に到達
+        return len(planned_path.points) - 1
+    
+    def _compute_cross_track_error(self, position: Position, planned_path: Path, 
+                                 closest_idx: int) -> np.ndarray:
+        """経路からの横方向誤差ベクトル計算"""
+        if closest_idx >= len(planned_path.points) - 1:
+            return np.zeros(2)
+        
+        # 現在の経路セグメント
+        current_point = planned_path.points[closest_idx].position
+        next_point = planned_path.points[closest_idx + 1].position
+        
+        # 経路方向ベクトル
+        path_direction = next_point.to_array() - current_point.to_array()
+        path_length = np.linalg.norm(path_direction)
+        
+        if path_length < self.config.min_distance:
+            return np.zeros(2)
+        
+        path_unit = path_direction / path_length
+        
+        # 現在位置から経路点への ベクトル
+        position_vector = position.to_array() - current_point.to_array()
+        
+        # 経路に垂直な成分（横方向誤差）
+        cross_track_distance = np.dot(position_vector, np.array([-path_unit[1], path_unit[0]]))
+        cross_track_vector = np.array([-path_unit[1], path_unit[0]]) * cross_track_distance
+        
+        return cross_track_vector
 
     def _compute_prediction_correction(self, position: Position,
                                      obstacles: List[DynamicObstacle],
@@ -606,15 +760,26 @@ class TVVFVOController:
 
     def update(self, robot_state: RobotState,
               obstacles: List[DynamicObstacle],
-              goal: Goal) -> ControlOutput:
+              goal: Goal, 
+              planned_path: Optional[Path] = None) -> ControlOutput:
         """制御更新関数"""
         start_time = time.time()
 
         try:
-            # TVVF計算
+            # A*経路の存在チェック
+            if planned_path is None or not planned_path.points:
+                # 経路がない場合は停止コマンドを返す
+                return ControlOutput(
+                    velocity_command=Velocity(0.0, 0.0),
+                    angular_velocity=0.0,
+                    execution_time=0.01,
+                    safety_margin=0.0
+                )
+            
+            # TVVF計算（A*経路統合版）
             tvvf_start = time.time()
             tvvf_vector = self.tvvf_generator.compute_vector(
-                robot_state.position, start_time, goal, obstacles
+                robot_state.position, start_time, goal, obstacles, planned_path
             )
             self.stats['tvvf_time'] = (time.time() - tvvf_start) * 1000
 
@@ -694,3 +859,240 @@ class TVVFVOController:
     def get_stats(self) -> Dict:
         """統計情報取得"""
         return self.stats.copy()
+
+# ============================================================================
+# A*経路計画クラス
+# ============================================================================
+
+class AStarNode:
+    """A*アルゴリズム用ノードクラス"""
+    
+    def __init__(self, position: Tuple[int, int], g_cost: float = 0.0, h_cost: float = 0.0, parent=None):
+        self.position = position  # (x, y) グリッド座標
+        self.g_cost = g_cost      # スタートからのコスト
+        self.h_cost = h_cost      # ゴールまでのヒューリスティックコスト
+        self.f_cost = g_cost + h_cost  # 総コスト
+        self.parent = parent      # 親ノード
+    
+    def __lt__(self, other):
+        return self.f_cost < other.f_cost
+    
+    def __eq__(self, other):
+        return self.position == other.position
+
+class AStarPathPlanner:
+    """A*アルゴリズムによる経路計画クラス"""
+    
+    def __init__(self, occupancy_grid, resolution: float, origin: Position, 
+                 wall_clearance_distance: float = 0.8):
+        """
+        Args:
+            occupancy_grid: OccupancyGridメッセージ
+            resolution: グリッドの解像度 [m/cell]
+            origin: グリッドの原点座標
+            wall_clearance_distance: 壁からの最小距離 [m]
+        """
+        self.width = occupancy_grid.info.width
+        self.height = occupancy_grid.info.height
+        self.resolution = resolution
+        self.origin = origin
+        self.wall_clearance_distance = wall_clearance_distance
+        
+        # 占有格子データを2D配列に変換
+        self.grid = np.array(occupancy_grid.data).reshape((self.height, self.width))
+        
+        # 占有閾値（0-100で100が完全占有）
+        self.occupied_threshold = 65
+        self.free_threshold = 25
+        
+        # 壁からの距離を考慮した膨張マップを作成
+        self.inflated_grid = self._create_inflated_grid()
+    
+    def world_to_grid(self, world_pos: Position) -> Tuple[int, int]:
+        """世界座標をグリッド座標に変換"""
+        grid_x = int((world_pos.x - self.origin.x) / self.resolution)
+        grid_y = int((world_pos.y - self.origin.y) / self.resolution)
+        return (grid_x, grid_y)
+    
+    def grid_to_world(self, grid_pos: Tuple[int, int]) -> Position:
+        """グリッド座標を世界座標に変換"""
+        world_x = grid_pos[0] * self.resolution + self.origin.x
+        world_y = grid_pos[1] * self.resolution + self.origin.y
+        return Position(world_x, world_y)
+    
+    def _create_inflated_grid(self) -> np.ndarray:
+        """壁からの距離を考慮した膨張マップを作成"""
+        inflated_grid = np.copy(self.grid)
+        
+        # 膨張半径をグリッドセルで計算
+        inflation_cells = int(self.wall_clearance_distance / self.resolution) + 1
+        
+        # 元の占有セルを特定
+        occupied_cells = np.where(self.grid >= self.occupied_threshold)
+        
+        # 各占有セルの周囲を膨張
+        for y, x in zip(occupied_cells[0], occupied_cells[1]):
+            for dy in range(-inflation_cells, inflation_cells + 1):
+                for dx in range(-inflation_cells, inflation_cells + 1):
+                    new_y, new_x = y + dy, x + dx
+                    
+                    # 境界チェック
+                    if (0 <= new_x < self.width and 0 <= new_y < self.height):
+                        # ユークリッド距離で膨張範囲を決定
+                        distance = math.sqrt(dx**2 + dy**2) * self.resolution
+                        if distance <= self.wall_clearance_distance:
+                            # 元が自由空間の場合のみ膨張値を設定
+                            if inflated_grid[new_y, new_x] < self.occupied_threshold:
+                                inflated_grid[new_y, new_x] = self.occupied_threshold
+        
+        return inflated_grid
+
+    def is_valid_position(self, grid_pos: Tuple[int, int]) -> bool:
+        """グリッド位置が有効かチェック（膨張マップ使用）"""
+        x, y = grid_pos
+        if x < 0 or x >= self.width or y < 0 or y >= self.height:
+            return False
+        
+        # 膨張マップで占有状態をチェック
+        cell_value = self.inflated_grid[y, x]
+        return cell_value >= 0 and cell_value < self.occupied_threshold
+    
+    def get_neighbors(self, position: Tuple[int, int]) -> List[Tuple[int, int]]:
+        """8近傍の有効な隣接セルを取得"""
+        x, y = position
+        neighbors = []
+        
+        # 8方向の移動（対角線も含む）
+        directions = [
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1),           (0, 1),
+            (1, -1),  (1, 0),  (1, 1)
+        ]
+        
+        for dx, dy in directions:
+            new_x, new_y = x + dx, y + dy
+            if self.is_valid_position((new_x, new_y)):
+                neighbors.append((new_x, new_y))
+        
+        return neighbors
+    
+    def heuristic(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
+        """ユークリッド距離ヒューリスティック"""
+        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+    
+    def get_movement_cost(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> float:
+        """移動コスト計算（対角線移動は√2倍）"""
+        dx = abs(to_pos[0] - from_pos[0])
+        dy = abs(to_pos[1] - from_pos[1])
+        
+        if dx == 1 and dy == 1:
+            return math.sqrt(2)  # 対角線移動
+        else:
+            return 1.0  # 直線移動
+    
+    def plan_path(self, start_pos: Position, goal_pos: Position) -> Optional[Path]:
+        """A*アルゴリズムによる経路計画"""
+        # 世界座標をグリッド座標に変換
+        start_grid = self.world_to_grid(start_pos)
+        goal_grid = self.world_to_grid(goal_pos)
+        
+        # 開始・終了位置の有効性チェック
+        if not self.is_valid_position(start_grid):
+            print(f"開始位置が無効: {start_grid}")
+            return None
+        
+        if not self.is_valid_position(goal_grid):
+            print(f"目標位置が無効: {goal_grid}")
+            return None
+        
+        # A*アルゴリズム
+        open_set = []
+        closed_set = set()
+        
+        # 開始ノード
+        start_node = AStarNode(
+            start_grid, 
+            g_cost=0.0, 
+            h_cost=self.heuristic(start_grid, goal_grid)
+        )
+        heapq.heappush(open_set, start_node)
+        
+        # ノード探索用辞書
+        open_dict = {start_grid: start_node}
+        
+        while open_set:
+            # 最小コストノードを取得
+            current_node = heapq.heappop(open_set)
+            current_pos = current_node.position
+            
+            # 辞書からも削除
+            if current_pos in open_dict:
+                del open_dict[current_pos]
+            
+            # ゴール到達チェック
+            if current_pos == goal_grid:
+                return self._reconstruct_path(current_node)
+            
+            # クローズドセットに追加
+            closed_set.add(current_pos)
+            
+            # 隣接ノードを探索
+            for neighbor_pos in self.get_neighbors(current_pos):
+                if neighbor_pos in closed_set:
+                    continue
+                
+                # 移動コスト計算
+                movement_cost = self.get_movement_cost(current_pos, neighbor_pos)
+                tentative_g_cost = current_node.g_cost + movement_cost
+                
+                # 既存ノードのチェック
+                if neighbor_pos in open_dict:
+                    neighbor_node = open_dict[neighbor_pos]
+                    if tentative_g_cost < neighbor_node.g_cost:
+                        # より良いパスを発見
+                        neighbor_node.g_cost = tentative_g_cost
+                        neighbor_node.f_cost = tentative_g_cost + neighbor_node.h_cost
+                        neighbor_node.parent = current_node
+                        heapq.heapify(open_set)  # ヒープを再構築
+                else:
+                    # 新しいノードを作成
+                    h_cost = self.heuristic(neighbor_pos, goal_grid)
+                    neighbor_node = AStarNode(
+                        neighbor_pos, 
+                        g_cost=tentative_g_cost, 
+                        h_cost=h_cost, 
+                        parent=current_node
+                    )
+                    heapq.heappush(open_set, neighbor_node)
+                    open_dict[neighbor_pos] = neighbor_node
+        
+        # 経路が見つからない
+        print("経路が見つかりませんでした")
+        return None
+    
+    def _reconstruct_path(self, goal_node: AStarNode) -> Path:
+        """ゴールノードから経路を再構築"""
+        path = Path()
+        current_node = goal_node
+        grid_path = []
+        
+        # 逆順にたどって経路を構築
+        while current_node is not None:
+            grid_path.append(current_node.position)
+            current_node = current_node.parent
+        
+        # 正順に変換して世界座標に変換
+        grid_path.reverse()
+        
+        for i, grid_pos in enumerate(grid_path):
+            world_pos = self.grid_to_world(grid_pos)
+            # 移動コストを計算（簡易版）
+            if i > 0:
+                prev_world_pos = self.grid_to_world(grid_path[i-1])
+                cost = world_pos.distance_to(prev_world_pos)
+            else:
+                cost = 0.0
+            
+            path.add_point(world_pos, cost)
+        
+        return path

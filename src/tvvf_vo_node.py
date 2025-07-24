@@ -17,6 +17,7 @@ import math
 # ROS2メッセージ
 from geometry_msgs.msg import Twist, PoseStamped, Point, Vector3, PointStamped
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -29,7 +30,7 @@ from geometry_msgs.msg import PointStamped as TfPointStamped
 # TVVF-VOコアロジック
 from .tvvf_vo_core import (
     TVVFVOController, TVVFVOConfig, RobotState, DynamicObstacle,
-    Goal, Position, Velocity, ControlOutput
+    Goal, Position, Velocity, ControlOutput, Path, AStarPathPlanner
 )
 
 
@@ -50,19 +51,46 @@ class TVVFVONode(Node):
         self.robot_state = None
         self.goal = None
         self.obstacles = []
+        self.occupancy_grid = None  # 占有格子地図
+        self.path_planner = None    # A*経路計画器
+        self.planned_path = None    # 計画された経路
+        self.last_planning_time = 0.0  # 最後の経路計画時刻
+        self.planning_interval = 2.0   # 再計画間隔（秒）
         self.last_update_time = time.time()
         self.last_velocity = Velocity(0.0, 0.0)  # 速度計算用
 
-        # TF2関連
-        self.tf_buffer = tf2_ros.Buffer()
+        # TF2関連（高速化設定）
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        # TF取得高速化用キャッシュ
+        self.tf_cache = {}
+        self.tf_cache_time = 0.0
+        self.tf_cache_duration = 0.05  # 50msキャッシュ
+        
+        # 可視化高速化用タイマー
+        self.last_vector_viz_time = 0.0
+        self.last_path_viz_time = 0.0
+        self.last_viz_time = 0.0
 
         # パブリッシャー
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.marker_pub = self.create_publisher(MarkerArray, 'tvvf_vo_markers', 10)
         self.vector_field_pub = self.create_publisher(MarkerArray, 'tvvf_vo_vector_field', 10)
+        self.path_pub = self.create_publisher(MarkerArray, 'planned_path', 10)
 
         # サブスクライバー
+        # mapトピック用（transient_local QoS）
+        from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, 'map', self.map_callback, map_qos
+        )
+        
         # rviz2のPublish Pointツール用
         self.clicked_point_sub = self.create_subscription(
             PointStamped, 'clicked_point', self.clicked_point_callback, 10
@@ -91,6 +119,24 @@ class TVVFVONode(Node):
                              ParameterDescriptor(description='Repulsion field strength'))
         self.declare_parameter('influence_radius', 3.0,
                              ParameterDescriptor(description='Obstacle influence radius [m]'))
+        
+        # A*経路統合パラメータ
+        self.declare_parameter('k_path_attraction', 2.0,
+                             ParameterDescriptor(description='Path following attraction strength'))
+        self.declare_parameter('path_influence_radius', 2.0,
+                             ParameterDescriptor(description='Path influence radius [m]'))
+        self.declare_parameter('lookahead_distance', 1.5,
+                             ParameterDescriptor(description='Lookahead distance [m]'))
+        self.declare_parameter('path_smoothing_factor', 0.8,
+                             ParameterDescriptor(description='Path smoothing factor'))
+        
+        # A*経路計画パラメータ
+        self.declare_parameter('wall_clearance_distance', 0.8,
+                             ParameterDescriptor(description='Minimum distance from walls [m]'))
+        self.declare_parameter('path_inflation_radius', 0.5,
+                             ParameterDescriptor(description='Path inflation radius [m]'))
+        self.declare_parameter('enable_dynamic_replanning', False,
+                             ParameterDescriptor(description='Enable dynamic replanning'))
 
         # VO関連パラメータ
         self.declare_parameter('time_horizon', 3.0,
@@ -139,10 +185,16 @@ class TVVFVONode(Node):
                              ParameterDescriptor(description='Enable vector field visualization'))
         self.declare_parameter('vector_field_resolution', 0.5,
                              ParameterDescriptor(description='Vector field sampling resolution [m]'))
-        self.declare_parameter('vector_field_range', 5.0,
+        self.declare_parameter('vector_field_range', 4.0,
                              ParameterDescriptor(description='Vector field visualization range [m]'))
-        self.declare_parameter('vector_scale_factor', 0.5,
+        self.declare_parameter('vector_scale_factor', 0.3,
                              ParameterDescriptor(description='Vector arrow scale factor'))
+        self.declare_parameter('max_vector_points', 500,
+                             ParameterDescriptor(description='Maximum number of vector points'))
+        self.declare_parameter('min_vector_magnitude', 0.05,
+                             ParameterDescriptor(description='Minimum vector magnitude for display'))
+        self.declare_parameter('viz_update_rate', 5.0,
+                             ParameterDescriptor(description='Visualization update rate [Hz]'))
         
 
 
@@ -152,6 +204,10 @@ class TVVFVONode(Node):
             k_attraction=self.get_parameter('k_attraction').value,
             k_repulsion=self.get_parameter('k_repulsion').value,
             influence_radius=self.get_parameter('influence_radius').value,
+            k_path_attraction=self.get_parameter('k_path_attraction').value,
+            path_influence_radius=self.get_parameter('path_influence_radius').value,
+            lookahead_distance=self.get_parameter('lookahead_distance').value,
+            path_smoothing_factor=self.get_parameter('path_smoothing_factor').value,
             time_horizon=self.get_parameter('time_horizon').value,
             safety_margin=self.get_parameter('safety_margin').value,
             vo_resolution=self.get_parameter('vo_resolution').value,
@@ -161,26 +217,32 @@ class TVVFVONode(Node):
 
 
     def _get_robot_pose_from_tf(self) -> Optional[RobotState]:
-        """TFからロボット位置を取得（改良版）"""
+        """TFからロボット位置を取得（高速化版）"""
         try:
+            current_time = time.time()
+            
+            # キャッシュチェック（50ms以内なら再利用）
+            if (current_time - self.tf_cache_time < self.tf_cache_duration and 
+                'robot_state' in self.tf_cache):
+                return self.tf_cache['robot_state']
+            
             base_frame = self.get_parameter('base_frame').value
             global_frame = self.get_parameter('global_frame').value
 
-            # 最新の利用可能なTF変換を取得（現在時刻ではなく、最新の利用可能な時刻を使用）
+            # 高速TF取得（タイムアウト短縮）
             try:
-                # 最初に最新のタイムスタンプを取得
-                latest_time = self.tf_buffer.get_latest_common_time(global_frame, base_frame)
+                # ゼロタイムで即座に取得（最も高速）
                 transform = self.tf_buffer.lookup_transform(
-                    global_frame, base_frame, latest_time,
-                    timeout=rclpy.duration.Duration(seconds=0.1)
+                    global_frame, base_frame, rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.01)  # 10ms短縮
                 )
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException):
-                # フォールバック: ゼロタイムで試行
-                transform = self.tf_buffer.lookup_transform(
-                    global_frame, base_frame, rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=0.1)
-                )
+                # キャッシュされた値があれば使用
+                if 'robot_state' in self.tf_cache:
+                    self.get_logger().debug('TF取得失敗、キャッシュを使用')
+                    return self.tf_cache['robot_state']
+                return None
 
             # 位置の取得
             position = Position(
@@ -238,6 +300,10 @@ class TVVFVONode(Node):
                 radius=self.get_parameter('robot_radius').value
             )
 
+            # キャッシュに保存
+            self.tf_cache['robot_state'] = robot_state
+            self.tf_cache_time = current_time
+
             return robot_state
 
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
@@ -284,16 +350,126 @@ class TVVFVONode(Node):
                 tolerance=self.get_parameter('goal_tolerance').value
             )
 
+            # 既存の経路をクリア（制御ループで新しい経路を計画する）
+            self.planned_path = None
+
             self.get_logger().info(f'クリックされたポイントをゴールに設定: ({goal_position.x:.2f}, {goal_position.y:.2f}) in frame {global_frame}')
+            self.get_logger().info('次の制御ループでA*経路計画を実行します')
 
         except Exception as e:
             self.get_logger().error(f'Clicked point callback error: {e}')
+
+    def map_callback(self, msg: OccupancyGrid):
+        """地図データコールバック"""
+        try:
+            self.occupancy_grid = msg
+            
+            # A*経路計画器を初期化
+            origin = Position(
+                msg.info.origin.position.x,
+                msg.info.origin.position.y
+            )
+            wall_clearance = self.get_parameter('wall_clearance_distance').value
+            self.path_planner = AStarPathPlanner(msg, msg.info.resolution, origin, wall_clearance)
+            
+            self.get_logger().info(f'地図データを受信: サイズ {msg.info.width}x{msg.info.height}, 解像度 {msg.info.resolution}m/cell')
+            
+        except Exception as e:
+            self.get_logger().error(f'Map callback error: {e}')
+    
+    def _plan_path_to_goal(self):
+        """現在位置からゴールまでの経路を計画"""
+        try:
+            if (self.path_planner is None or 
+                self.robot_state is None or 
+                self.goal is None):
+                self.get_logger().warn('経路計画に必要な情報が不足しています')
+                return
+            
+            # A*アルゴリズムで経路計画
+            start_time = time.time()
+            self.planned_path = self.path_planner.plan_path(
+                self.robot_state.position,
+                self.goal.position
+            )
+            planning_time = (time.time() - start_time) * 1000  # ms
+            
+            if self.planned_path is not None:
+                path_length = len(self.planned_path.points)
+                self.get_logger().info(
+                    f'経路計画完了: {path_length}点, 総コスト: {self.planned_path.total_cost:.2f}m, '
+                    f'計画時間: {planning_time:.1f}ms'
+                )
+                
+                # 経路可視化の配信
+                self._publish_path_visualization()
+            else:
+                self.get_logger().warn('経路が見つかりませんでした')
+                self.planned_path = None
+                
+        except Exception as e:
+            self.get_logger().error(f'Path planning error: {e}')
+            self.planned_path = None
+    
+    def _check_dynamic_replanning(self):
+        """動的再計画の必要性をチェック"""
+        try:
+            current_time = time.time()
+            
+            # 時間間隔チェック
+            if current_time - self.last_planning_time < self.planning_interval:
+                return
+            
+            # 経路が存在しない場合はスキップ
+            if (self.planned_path is None or 
+                self.robot_state is None or 
+                self.goal is None or
+                self.path_planner is None):
+                return
+            
+            # 障害物が経路を阻害しているかチェック
+            if self._is_path_blocked():
+                self.get_logger().info('経路が阻害されました。再計画を実行します。')
+                self._plan_path_to_goal()
+                self.last_planning_time = current_time
+            
+        except Exception as e:
+            self.get_logger().error(f'Dynamic replanning check error: {e}')
+    
+    def _is_path_blocked(self) -> bool:
+        """現在の経路が障害物によって阻害されているかチェック"""
+        if not self.planned_path or not self.planned_path.points:
+            return False
+        
+        # 現在位置から少し先の経路をチェック
+        robot_pos = self.robot_state.position
+        check_distance = 3.0  # 3m先までチェック
+        
+        for path_point in self.planned_path.points:
+            # 現在位置からの距離が check_distance 以内の点をチェック
+            distance_from_robot = robot_pos.distance_to(path_point.position)
+            if distance_from_robot > check_distance:
+                continue
+            
+            # 各障害物が経路点に近すぎるかチェック
+            for obstacle in self.obstacles:
+                distance_to_obstacle = path_point.position.distance_to(obstacle.position)
+                safety_distance = obstacle.radius + self.robot_state.radius + 0.5  # 安全マージン
+                
+                if distance_to_obstacle < safety_distance:
+                    return True
+        
+        return False
 
     def laser_callback(self, msg: LaserScan):
         """レーザースキャンコールバック"""
         try:
             # 障害物検出
             self.obstacles = self._detect_obstacles_from_laser(msg)
+            
+            # 動的再計画チェック（設定により制御）
+            if self.get_parameter('enable_dynamic_replanning').value:
+                self._check_dynamic_replanning()
 
         except Exception as e:
             self.get_logger().error(f'Laser callback error: {e}')
@@ -445,18 +621,39 @@ class TVVFVONode(Node):
             if self.robot_state is None or self.goal is None:
                 return
 
+            # A*経路計画チェック（経路がない場合は計画実行）
+            astar_time = 0.0
+            if self.planned_path is None and self.path_planner is not None:
+                self.get_logger().info('A*経路計画を実行中...')
+                path_planning_start = time.time()
+                self._plan_path_to_goal()
+                astar_time = (time.time() - path_planning_start) * 1000  # ms
+                
+                if self.planned_path is not None:
+                    self.get_logger().info(f'A*経路計画完了: {astar_time:.1f}ms, 経路点数: {len(self.planned_path.points)}')
+                else:
+                    self.get_logger().warn(f'A*経路計画失敗: {astar_time:.1f}ms - ロボットを停止します')
+
             # 目標到達チェック
             distance_to_goal = self.robot_state.position.distance_to(self.goal.position)
             if distance_to_goal < self.goal.tolerance:
                 # 停止コマンド送信
                 self._publish_stop_command()
-                self.get_logger().info('ゴールに到達しました！')
+                
+                # 経路とゴールをクリア
+                self.planned_path = None
+                self.goal = None
+                
+                # 空の可視化マーカーを送信
+                self._publish_empty_visualization()
+                
+                self.get_logger().info('ゴールに到達しました！経路とゴールをクリアしました。')
                 return
 
-            # TVVF-VO制御更新
+            # TVVF-VO制御更新（A*経路が完了してから実行）
             tvvf_start_time = time.time()
             control_output = self.controller.update(
-                self.robot_state, self.obstacles, self.goal
+                self.robot_state, self.obstacles, self.goal, self.planned_path
             )
             tvvf_time = (time.time() - tvvf_start_time) * 1000  # ms
 
@@ -475,23 +672,19 @@ class TVVFVONode(Node):
             # デバッグ出力（常時実行）
             self._print_debug_info(stats, distance_to_goal, tf_time, tvvf_time, cmd_time)
 
-            # 可視化
-            if self.get_parameter('enable_visualization').value:
-                self._publish_visualization()
-
-            # ベクトル場可視化
-            if self.get_parameter('enable_vector_field_viz').value:
-                self._publish_vector_field_visualization()
+            # 高速化された可視化（頻度制御付き）
+            viz_time = self._publish_optimized_visualization()
             
             viz_time = (time.time() - viz_start_time) * 1000  # ms
 
             # 全体処理時間
             total_time = (time.time() - loop_start_time) * 1000  # ms
             
-            # 処理時間のログ出力（常時出力）
+            # 処理時間のログ出力（A*時間も含む）
             self.get_logger().info(
                 f'TVVF-VO Processing Time: '
                 f'Total: {total_time:.1f}ms, '
+                f'A*: {astar_time:.1f}ms, '
                 f'TF: {tf_time:.1f}ms, '
                 f'TVVF: {tvvf_time:.1f}ms, '
                 f'Cmd: {cmd_time:.1f}ms, '
@@ -587,8 +780,11 @@ class TVVFVONode(Node):
     def _publish_vector_field_visualization(self):
         """ベクトル場の可視化マーカーの配信（常時表示版）"""
         try:
-            if self.robot_state is None or self.goal is None:
+            if self.robot_state is None:
+                self.get_logger().debug('ベクトル場可視化: ロボット状態がない')
                 return
+            
+            self.get_logger().info(f'ベクトル場可視化: ゴール={self.goal is not None}, 経路={self.planned_path is not None}')
 
             marker_array = MarkerArray()
             marker_id = 0
@@ -597,31 +793,43 @@ class TVVFVONode(Node):
             resolution = self.get_parameter('vector_field_resolution').value
             viz_range = self.get_parameter('vector_field_range').value
             scale_factor = self.get_parameter('vector_scale_factor').value
+            max_points = self.get_parameter('max_vector_points').value
+            min_magnitude = self.get_parameter('min_vector_magnitude').value
 
             # ロボット位置を中心としたグリッドを作成
             robot_x = self.robot_state.position.x
             robot_y = self.robot_state.position.y
 
-            # グリッドポイントを生成（解像度を上げて計算量を削減）
-            num_points = int(viz_range * 2 / resolution) + 1
+            # 高密度グリッドポイントを生成
+            num_points_x = int(viz_range * 2 / resolution) + 1
+            num_points_y = int(viz_range * 2 / resolution) + 1
+            total_points = num_points_x * num_points_y
             
-            # 計算量削減のため、グリッドポイント数を制限
-            max_points = 100  # 最大100ポイントに制限
-            if num_points * num_points > max_points:
-                # 解像度を動的に調整
-                resolution = math.sqrt((viz_range * 2) ** 2 / max_points)
-                num_points = int(viz_range * 2 / resolution) + 1
+            # 適応的サンプリング：総ポイント数が制限を超える場合のみ間引き
+            if total_points > max_points:
+                skip_factor = max(2, int(math.sqrt(total_points / max_points) * 1.2))  # 控えめに間引き
+            else:
+                skip_factor = 1  # 基本解像度でサンプリング（より細かく）
 
             start_x = robot_x - viz_range
             start_y = robot_y - viz_range
+            
+            # 有効なベクトルカウンター
+            valid_vector_count = 0
 
-            # ベクトル場計算の高速化
-            for i in range(0, num_points, 2):  # 2つおきにサンプリング
-                for j in range(0, num_points, 2):
+            # 高密度ベクトル場計算（適切な制限チェック付き）
+            break_outer = False
+            for i in range(0, num_points_x, skip_factor):
+                for j in range(0, num_points_y, skip_factor):
+                    # 制限チェック
+                    if valid_vector_count >= max_points:
+                        break_outer = True
+                        break
+                        
                     sample_x = start_x + i * resolution
                     sample_y = start_y + j * resolution
 
-                    # 簡易ベクトル場計算（TVVF-VO制御器を使わない高速版）
+                    # ベクトル場計算
                     vector_x, vector_y = self._calculate_simple_vector_field(
                         sample_x, sample_y, robot_x, robot_y
                     )
@@ -630,69 +838,176 @@ class TVVFVONode(Node):
                     magnitude = math.sqrt(vector_x**2 + vector_y**2)
 
                     # 小さすぎるベクトルはスキップ
-                    if magnitude < 0.01:
+                    if magnitude < min_magnitude:
                         continue
 
-                    # 矢印マーカーを作成
+                    # 矢印マーカーを作成（色情報付き）
+                    vector_type = self._classify_vector_type(sample_x, sample_y)
                     arrow_marker = self._create_vector_arrow_marker(
                         marker_id, sample_x, sample_y, vector_x, vector_y,
-                        magnitude, scale_factor
+                        magnitude, scale_factor, vector_type
                     )
                     marker_array.markers.append(arrow_marker)
                     marker_id += 1
+                    valid_vector_count += 1
+                
+                # 外側ループも適切に終了
+                if break_outer:
+                    break
 
             self.vector_field_pub.publish(marker_array)
+            self.get_logger().info(f'ベクトル場可視化完了: {valid_vector_count}個のベクトルを送信')
 
         except Exception as e:
             self.get_logger().error(f'Vector field visualization error: {e}')
 
     def _calculate_simple_vector_field(self, sample_x: float, sample_y: float, 
                                      robot_x: float, robot_y: float) -> tuple:
-        """簡易ベクトル場計算（高速版）"""
-        # 目標への引力
+        """簡易ベクトル場計算（A*統合版）"""
+        sample_position = Position(sample_x, sample_y)
+        vector_x, vector_y = 0.0, 0.0
+        
+        # A*経路がある場合は経路追従ベクトル場を使用
+        if self.planned_path is not None and self.planned_path.points:
+            path_vector = self._compute_path_vector_for_visualization(sample_position)
+            vector_x += path_vector[0]
+            vector_y += path_vector[1]
+        
+        # ゴール引力（ゴールが設定されている場合のみ）
         if self.goal is not None:
-            goal_x = self.goal.position.x
-            goal_y = self.goal.position.y
-            
-            # 目標への方向ベクトル
-            dx_goal = goal_x - sample_x
-            dy_goal = goal_y - sample_y
-            dist_goal = math.sqrt(dx_goal**2 + dy_goal**2)
-            
-            if dist_goal > 0.1:
-                # 引力（距離に反比例）
-                attraction_strength = 1.0 / (1.0 + dist_goal)
-                vector_x = dx_goal * attraction_strength
-                vector_y = dy_goal * attraction_strength
-            else:
-                vector_x = 0.0
-                vector_y = 0.0
-        else:
-            vector_x = 0.0
-            vector_y = 0.0
+            goal_vector = self._compute_goal_vector_for_visualization(sample_position)
+            vector_x += goal_vector[0]
+            vector_y += goal_vector[1]
+        elif self.planned_path is None:
+            # ゴールも経路もない場合は、ベクトル場を表示しない
+            return 0.0, 0.0
 
-        # 障害物からの斥力（簡易版）
+        # 障害物からの斥力
         for obstacle in self.obstacles:
             obs_x = obstacle.position.x
             obs_y = obstacle.position.y
             
-            # 障害物への方向ベクトル
             dx_obs = sample_x - obs_x
             dy_obs = sample_y - obs_y
             dist_obs = math.sqrt(dx_obs**2 + dy_obs**2)
             
             if dist_obs < obstacle.radius + 0.5:  # 影響範囲内
                 if dist_obs > 0.1:
-                    # 斥力（距離の逆数）
                     repulsion_strength = 0.5 / (dist_obs + 0.1)
                     vector_x += dx_obs * repulsion_strength
                     vector_y += dy_obs * repulsion_strength
 
         return vector_x, vector_y
+    
+    def _compute_path_vector_for_visualization(self, position: Position) -> tuple:
+        """可視化用の経路追従ベクトル計算"""
+        if not self.planned_path or not self.planned_path.points:
+            return (0.0, 0.0)
+        
+        # 最も近い経路点を見つける
+        min_distance = float('inf')
+        closest_idx = 0
+        
+        for i, path_point in enumerate(self.planned_path.points):
+            distance = position.distance_to(path_point.position)
+            if distance < min_distance:
+                min_distance = distance
+                closest_idx = i
+        
+        # 先読み点を計算
+        lookahead_distance = self.get_parameter('lookahead_distance').value
+        target_idx = closest_idx
+        accumulated_distance = 0.0
+        
+        for i in range(closest_idx, len(self.planned_path.points) - 1):
+            segment_distance = self.planned_path.points[i].position.distance_to(
+                self.planned_path.points[i + 1].position
+            )
+            accumulated_distance += segment_distance
+            
+            if accumulated_distance >= lookahead_distance:
+                target_idx = i + 1
+                break
+            else:
+                target_idx = i + 1
+        
+        if target_idx >= len(self.planned_path.points):
+            target_idx = len(self.planned_path.points) - 1
+        
+        # 目標点への方向ベクトル
+        target_pos = self.planned_path.points[target_idx].position
+        dx = target_pos.x - position.x
+        dy = target_pos.y - position.y
+        distance = math.sqrt(dx**2 + dy**2)
+        
+        if distance > 0.1:
+            # 経路影響範囲内でのみ有効
+            path_influence = self.get_parameter('path_influence_radius').value
+            if min_distance < path_influence:
+                strength = self.get_parameter('k_path_attraction').value / 2.0
+                influence_factor = max(0.0, (path_influence - min_distance) / path_influence)
+                return (dx * strength * influence_factor, dy * strength * influence_factor)
+        
+        return (0.0, 0.0)
+    
+    def _compute_goal_vector_for_visualization(self, position: Position) -> tuple:
+        """可視化用のゴール引力ベクトル計算"""
+        if self.goal is None:
+            return (0.0, 0.0)
+        
+        # A*経路がある場合は経路終端付近でのみゴール引力を適用
+        if self.planned_path is not None and self.planned_path.points:
+            final_path_point = self.planned_path.points[-1].position
+            distance_to_final = position.distance_to(final_path_point)
+            lookahead_distance = self.get_parameter('lookahead_distance').value
+            
+            if distance_to_final > lookahead_distance * 2:
+                return (0.0, 0.0)  # 経路追従を優先
+        
+        # ゴールへの方向ベクトル
+        dx_goal = self.goal.position.x - position.x
+        dy_goal = self.goal.position.y - position.y
+        dist_goal = math.sqrt(dx_goal**2 + dy_goal**2)
+        
+        if dist_goal > 0.1:
+            attraction_strength = self.get_parameter('k_attraction').value / 2.0
+            if dist_goal > self.goal.tolerance * 2:
+                return (dx_goal * attraction_strength / dist_goal, 
+                       dy_goal * attraction_strength / dist_goal)
+            else:
+                # ゴール近傍では弱い引力
+                return (dx_goal * attraction_strength * 0.5, 
+                       dy_goal * attraction_strength * 0.5)
+        
+        return (0.0, 0.0)
 
+    def _classify_vector_type(self, sample_x: float, sample_y: float) -> str:
+        """ベクトルの種類を分類（色分け用）"""
+        sample_position = Position(sample_x, sample_y)
+        
+        # A*経路がある場合の経路追従領域チェック
+        if self.planned_path is not None and self.planned_path.points:
+            min_distance = float('inf')
+            for path_point in self.planned_path.points:
+                distance = sample_position.distance_to(path_point.position)
+                min_distance = min(min_distance, distance)
+            
+            path_influence = self.get_parameter('path_influence_radius').value
+            if min_distance < path_influence:
+                return "path_following"
+        
+        # ゴール近傍チェック
+        if self.goal is not None:
+            distance_to_goal = sample_position.distance_to(self.goal.position)
+            if distance_to_goal < self.goal.tolerance * 3:
+                return "goal_attraction"
+        
+        # デフォルト
+        return "general"
+    
     def _create_vector_arrow_marker(self, marker_id: int, x: float, y: float,
                                   vx: float, vy: float, magnitude: float,
-                                  scale_factor: float) -> Marker:
+                                  scale_factor: float, vector_type: str = "general") -> Marker:
         """ベクトル矢印マーカー作成"""
         marker = Marker()
         marker.header.frame_id = self.get_parameter('global_frame').value
@@ -714,20 +1029,32 @@ class TVVFVONode(Node):
 
         marker.points = [start_point, end_point]
 
-        # 矢印のスケール
-        marker.scale.x = 0.05  # 矢印の軸の太さ
-        marker.scale.y = 0.1   # 矢印の頭の幅
-        marker.scale.z = 0.1   # 矢印の頭の高さ
+        # 矢印のスケール（細かい表示用に調整）
+        marker.scale.x = 0.03  # 矢印の軸の太さ（細く）
+        marker.scale.y = 0.06  # 矢印の頭の幅（小さく）
+        marker.scale.z = 0.06  # 矢印の頭の高さ（小さく）
 
-        # 色設定（速度の大きさに基づく）
-        # 青（低速）から赤（高速）へのグラデーション
-        max_magnitude = 2.0  # 想定最大速度
-        normalized_magnitude = min(magnitude / max_magnitude, 1.0)
-
-        marker.color.r = normalized_magnitude
-        marker.color.g = 0.0
-        marker.color.b = 1.0 - normalized_magnitude
-        marker.color.a = 0.8
+        # 色設定（ベクトルの種類に基づく）
+        if vector_type == "path_following":
+            # 経路追従: 緑系
+            marker.color.r = 0.2
+            marker.color.g = 0.8
+            marker.color.b = 0.2
+            marker.color.a = 0.9
+        elif vector_type == "goal_attraction":
+            # ゴール引力: 青系
+            marker.color.r = 0.2
+            marker.color.g = 0.2
+            marker.color.b = 0.8
+            marker.color.a = 0.9
+        else:
+            # 一般的なベクトル: 速度の大きさに基づく色分け
+            max_magnitude = 2.0
+            normalized_magnitude = min(magnitude / max_magnitude, 1.0)
+            marker.color.r = normalized_magnitude
+            marker.color.g = 0.0
+            marker.color.b = 1.0 - normalized_magnitude
+            marker.color.a = 0.8
 
         marker.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
 
@@ -784,8 +1111,12 @@ class TVVFVONode(Node):
                 goal_marker = self._create_goal_marker(marker_id)
                 marker_array.markers.append(goal_marker)
                 marker_id += 1
+                self.get_logger().info(f'ゴールマーカーを作成: ({self.goal.position.x:.2f}, {self.goal.position.y:.2f})')
+            else:
+                self.get_logger().debug('ゴールが設定されていません')
 
             self.marker_pub.publish(marker_array)
+            self.get_logger().debug(f'基本可視化完了: {len(marker_array.markers)}個のマーカーを送信')
 
         except Exception as e:
             self.get_logger().error(f'Visualization error: {e}')
@@ -815,6 +1146,131 @@ class TVVFVONode(Node):
         marker.color.a = 0.8
 
         return marker
+    
+    def _publish_path_visualization(self):
+        """計画された経路の可視化マーカーを配信"""
+        try:
+            if self.planned_path is None or not self.planned_path.points:
+                return
+            
+            marker_array = MarkerArray()
+            global_frame = self.get_parameter('global_frame').value
+            
+            # 線分マーカー（経路全体）
+            line_marker = Marker()
+            line_marker.header.frame_id = global_frame
+            line_marker.header.stamp = self.get_clock().now().to_msg()
+            line_marker.id = 0
+            line_marker.type = Marker.LINE_STRIP
+            line_marker.action = Marker.ADD
+            
+            # 経路の点を追加
+            for path_point in self.planned_path.points:
+                point = Point()
+                point.x = path_point.position.x
+                point.y = path_point.position.y
+                point.z = 0.05  # 地面から少し浮かせる
+                line_marker.points.append(point)
+            
+            # 線の設定
+            line_marker.scale.x = 0.05  # 線の太さ
+            line_marker.color.r = 1.0   # 赤色
+            line_marker.color.g = 0.0
+            line_marker.color.b = 0.0
+            line_marker.color.a = 0.8   # 透明度
+            
+            marker_array.markers.append(line_marker)
+            
+            # 経路点マーカー（サンプリング）
+            marker_id = 1
+            point_interval = max(1, len(self.planned_path.points) // 20)  # 最大20点まで
+            
+            for i in range(0, len(self.planned_path.points), point_interval):
+                path_point = self.planned_path.points[i]
+                
+                point_marker = Marker()
+                point_marker.header.frame_id = global_frame
+                point_marker.header.stamp = self.get_clock().now().to_msg()
+                point_marker.id = marker_id
+                point_marker.type = Marker.SPHERE
+                point_marker.action = Marker.ADD
+                
+                point_marker.pose.position.x = path_point.position.x
+                point_marker.pose.position.y = path_point.position.y
+                point_marker.pose.position.z = 0.05
+                
+                point_marker.scale.x = 0.1
+                point_marker.scale.y = 0.1
+                point_marker.scale.z = 0.1
+                
+                # 進行に従って色を変化（青→緑）
+                progress = i / len(self.planned_path.points)
+                point_marker.color.r = 0.0
+                point_marker.color.g = progress
+                point_marker.color.b = 1.0 - progress
+                point_marker.color.a = 0.9
+                
+                marker_array.markers.append(point_marker)
+                marker_id += 1
+            
+            self.path_pub.publish(marker_array)
+            
+        except Exception as e:
+            self.get_logger().error(f'Path visualization error: {e}')
+    
+    def _publish_empty_visualization(self):
+        """空の可視化マーカーを送信（経路・ゴール・ベクトル場をクリア）"""
+        try:
+            # 削除用マーカーを作成
+            empty_marker_array = MarkerArray()
+            
+            # 削除マーカー（すべてのマーカーを削除）
+            delete_marker = Marker()
+            delete_marker.header.frame_id = "map"
+            delete_marker.header.stamp = self.get_clock().now().to_msg()
+            delete_marker.action = Marker.DELETEALL
+            delete_marker.id = 0
+            empty_marker_array.markers.append(delete_marker)
+            
+            # 各トピックに削除マーカーを送信
+            self.marker_pub.publish(empty_marker_array)
+            self.path_pub.publish(empty_marker_array)
+            self.vector_field_pub.publish(empty_marker_array)
+            
+            self.get_logger().info('可視化マーカーをクリアしました')
+            
+        except Exception as e:
+            self.get_logger().error(f'Empty visualization error: {e}')
+    
+    def _publish_optimized_visualization(self) -> float:
+        """最適化された可視化処理（頻度制御付き）"""
+        viz_time = 0.0
+        current_time = time.time()
+        viz_update_interval = 1.0 / self.get_parameter('viz_update_rate').value  # 5Hz = 0.2s間隔
+        
+        try:
+            # 基本可視化（ゴール表示のみ）- 高頻度
+            if self.get_parameter('enable_visualization').value:
+                if current_time - self.last_viz_time > 0.1:  # 10Hz
+                    self._publish_visualization()
+                    self.last_viz_time = current_time
+
+            # 経路可視化 - 中頻度
+            if (self.planned_path is not None and 
+                current_time - self.last_path_viz_time > viz_update_interval):
+                self._publish_path_visualization()
+                self.last_path_viz_time = current_time
+
+            # ベクトル場可視化 - 低頻度（最も重い処理）
+            if (self.get_parameter('enable_vector_field_viz').value and
+                current_time - self.last_vector_viz_time > viz_update_interval):
+                self._publish_vector_field_visualization()
+                self.last_vector_viz_time = current_time
+                
+        except Exception as e:
+            self.get_logger().error(f'Optimized visualization error: {e}')
+        
+        return viz_time
 
 
 

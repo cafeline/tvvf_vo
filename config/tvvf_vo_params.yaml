@@ -7,6 +7,17 @@
     k_attraction: 1.2          # 引力場強度
     k_repulsion: 2.5           # 斥力場強度
     influence_radius: 3.0      # 障害物影響半径 [m]
+    
+    # A*経路統合パラメータ
+    k_path_attraction: 2.0     # 経路追従の引力強度
+    path_influence_radius: 2.0 # 経路の影響半径 [m]
+    lookahead_distance: 1.5    # 先読み距離 [m]
+    path_smoothing_factor: 0.8 # 経路スムージング係数
+    
+    # A*経路計画パラメータ
+    wall_clearance_distance: 0.8  # 壁からの最小距離 [m]
+    path_inflation_radius: 0.5    # 経路膨張半径 [m]
+    enable_dynamic_replanning: false  # 動的再計画の有効/無効
 
     # VO関連パラメータ
     time_horizon: 3.0          # VO時間ホライズン [s]
@@ -21,6 +32,7 @@
     # 制御関連パラメータ
     goal_tolerance: 0.15       # 目標許容誤差 [m]
     max_computation_time: 0.05 # 最大計算時間 [s]
+    control_loop_rate: 20.0    # 制御ループ周波数 [Hz]
 
     # 最適化重み
     direction_weight: 1.0      # 方向類似性重み
@@ -34,6 +46,15 @@
     # デバッグ・可視化
     enable_visualization: true # 可視化マーカー有効
     enable_debug_output: false # デバッグ出力有効
+    
+    # ベクトル場可視化パラメータ（高速化設定）
+    enable_vector_field_viz: true # ベクトル場可視化有効
+    vector_field_resolution: 0.3  # より細かい解像度
+    vector_field_range: 4.0       # 範囲を狭く（高速化）
+    vector_scale_factor: 0.3      # ベクトル矢印スケール係数
+    max_vector_points: 50        # 最大表示数を削減（高速化）
+    min_vector_magnitude: 0.05    # 閾値を上げて少数精鋭
+    viz_update_rate: 5.0          # 可視化更新レート[Hz]（高速化）
 
     # 障害物検出パラメータ
     min_obstacle_distance: 0.3    # 最小障害物検出距離 [m]
