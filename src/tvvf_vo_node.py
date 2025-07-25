@@ -130,6 +130,22 @@ class TVVFVONode(Node):
         self.declare_parameter('path_smoothing_factor', 0.8,
                              ParameterDescriptor(description='Path smoothing factor'))
         
+        # 経路平滑化パラメータ
+        self.declare_parameter('smoothing_method', 'gaussian',
+                             ParameterDescriptor(description='Smoothing method (gaussian/weighted/cubic_spline/bezier/simple)'))
+        self.declare_parameter('smoothing_iterations', 3,
+                             ParameterDescriptor(description='Number of smoothing iterations'))
+        self.declare_parameter('smoothing_window', 5,
+                             ParameterDescriptor(description='Gaussian smoothing window size'))
+        self.declare_parameter('smoothing_strength', 0.7,
+                             ParameterDescriptor(description='Smoothing strength (0.0-1.0)'))
+        self.declare_parameter('enable_path_optimization', True,
+                             ParameterDescriptor(description='Enable path optimization'))
+        self.declare_parameter('enable_path_shortcuts', True,
+                             ParameterDescriptor(description='Enable path shortcut detection'))
+        self.declare_parameter('max_shortcut_attempts', 30,
+                             ParameterDescriptor(description='Maximum shortcut detection attempts'))
+        
         # A*経路計画パラメータ
         self.declare_parameter('wall_clearance_distance', 0.8,
                              ParameterDescriptor(description='Minimum distance from walls [m]'))
@@ -388,18 +404,70 @@ class TVVFVONode(Node):
             
             # A*アルゴリズムで経路計画
             start_time = time.time()
-            self.planned_path = self.path_planner.plan_path(
+            raw_path = self.path_planner.plan_path(
                 self.robot_state.position,
                 self.goal.position
             )
-            planning_time = (time.time() - start_time) * 1000  # ms
             
-            if self.planned_path is not None:
+            if raw_path is not None:
+                # 経路最適化パラメータを取得
+                enable_path_optimization = self.get_parameter('enable_path_optimization').value
+                enable_path_shortcuts = self.get_parameter('enable_path_shortcuts').value
+                smoothing_method = self.get_parameter('smoothing_method').value
+                smoothing_iterations = self.get_parameter('smoothing_iterations').value
+                smoothing_window = self.get_parameter('smoothing_window').value
+                smoothing_strength = self.get_parameter('smoothing_strength').value
+                max_shortcut_attempts = self.get_parameter('max_shortcut_attempts').value
+                
+                # 高度な経路最適化を実行（オプション）
+                if enable_path_optimization:
+                    self.planned_path = self.path_planner.optimize_path(
+                        raw_path,
+                        enable_shortcuts=enable_path_shortcuts,
+                        enable_smoothing=True,
+                        smoothing_method=smoothing_method,
+                        max_shortcut_attempts=max_shortcut_attempts
+                    )
+                    
+                    # 必要に応じて追加の平滑化を実行
+                    if smoothing_iterations > 3:  # 標準より多い反復が設定されている場合
+                        self.planned_path = self.path_planner.smooth_path(
+                            self.planned_path,
+                            smoothing_method=smoothing_method,
+                            smoothing_iterations=smoothing_iterations - 3,  # 最適化で既に3回実行済み
+                            smoothing_window=smoothing_window,
+                            smoothing_factor=smoothing_strength
+                        )
+                else:
+                    # 基本的な平滑化のみ
+                    self.planned_path = self.path_planner.smooth_path(
+                        raw_path,
+                        smoothing_method="simple",  # シンプルな手法を使用
+                        smoothing_iterations=2,
+                        smoothing_factor=0.5
+                    )
+                
+                planning_time = (time.time() - start_time) * 1000  # ms
                 path_length = len(self.planned_path.points)
-                self.get_logger().info(
-                    f'経路計画完了: {path_length}点, 総コスト: {self.planned_path.total_cost:.2f}m, '
-                    f'計画時間: {planning_time:.1f}ms'
-                )
+                raw_path_length = len(raw_path.points)
+                
+                # 最適化効果をログ出力
+                if enable_path_optimization:
+                    path_length_reduction = raw_path_length - path_length
+                    cost_reduction = raw_path.total_cost - self.planned_path.total_cost
+                    
+                    self.get_logger().info(
+                        f'経路最適化完了: 原経路{raw_path_length}点({raw_path.total_cost:.2f}m) → '
+                        f'最適化後{path_length}点({self.planned_path.total_cost:.2f}m), '
+                        f'削減: {path_length_reduction}点({cost_reduction:.2f}m), '
+                        f'手法: {smoothing_method}, ショートカット: {enable_path_shortcuts}, '
+                        f'計画時間: {planning_time:.1f}ms'
+                    )
+                else:
+                    self.get_logger().info(
+                        f'経路計画完了: {path_length}点, 総コスト: {self.planned_path.total_cost:.2f}m, '
+                        f'計画時間: {planning_time:.1f}ms'
+                    )
                 
                 # 経路可視化の配信
                 self._publish_path_visualization()

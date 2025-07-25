@@ -14,6 +14,15 @@
     lookahead_distance: 1.5    # 先読み距離 [m]
     path_smoothing_factor: 0.8 # 経路スムージング係数
     
+    # 経路平滑化パラメータ
+    smoothing_method: "gaussian"        # 平滑化手法 ("gaussian", "weighted", "cubic_spline", "bezier", "simple")
+    smoothing_iterations: 3             # 平滑化反復回数
+    smoothing_window: 5                 # ガウシアン平滑化ウィンドウサイズ
+    smoothing_strength: 0.7             # 平滑化強度 (0.0-1.0)
+    enable_path_optimization: true      # 経路最適化の有効/無効
+    enable_path_shortcuts: true         # ショートカット検出の有効/無効
+    max_shortcut_attempts: 30           # ショートカット検出の最大試行回数
+    
     # A*経路計画パラメータ
     wall_clearance_distance: 0.8  # 壁からの最小距離 [m]
     path_inflation_radius: 0.5    # 経路膨張半径 [m]

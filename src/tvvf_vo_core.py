@@ -1096,3 +1096,369 @@ class AStarPathPlanner:
             path.add_point(world_pos, cost)
         
         return path
+
+    def smooth_path(self, path: Path, 
+                   smoothing_method: str = "gaussian",
+                   smoothing_iterations: int = 3,
+                   smoothing_window: int = 5,
+                   smoothing_factor: float = 0.8) -> Path:
+        """
+        経路の平滑化（複数手法対応）
+        
+        Args:
+            path: 元の経路
+            smoothing_method: 平滑化手法 ("gaussian", "weighted", "cubic_spline", "simple")
+            smoothing_iterations: 平滑化の反復回数
+            smoothing_window: ガウシアン平滑化ウィンドウサイズ
+            smoothing_factor: 平滑化強度 (0.0-1.0)
+            
+        Returns:
+            平滑化された経路
+        """
+        if len(path.points) <= 2:
+            return path
+        
+        # Position配列に変換
+        positions = [point.position for point in path.points]
+        
+        if smoothing_method == "gaussian":
+            smoothed_positions = self._gaussian_smooth_positions(
+                positions, smoothing_iterations, smoothing_window, smoothing_factor)
+        elif smoothing_method == "weighted":
+            smoothed_positions = self._weighted_smooth_positions(
+                positions, smoothing_iterations, smoothing_factor)
+        elif smoothing_method == "cubic_spline":
+            smoothed_positions = self._cubic_spline_smooth_positions(
+                positions, smoothing_factor)
+        else:  # "simple"
+            smoothed_positions = self._simple_smooth_positions(
+                positions, smoothing_iterations)
+        
+        # 平滑化されたPathオブジェクトを作成
+        smoothed_path = Path()
+        for i, pos in enumerate(smoothed_positions):
+            if i > 0:
+                cost = pos.distance_to(smoothed_positions[i-1])
+            else:
+                cost = 0.0
+            smoothed_path.add_point(pos, cost)
+        
+        return smoothed_path
+
+    def _gaussian_smooth_positions(self, positions: List[Position],
+                                 iterations: int = 3,
+                                 window_size: int = 5,
+                                 smoothing_factor: float = 0.8) -> List[Position]:
+        """ガウシアンフィルタによる位置の平滑化"""
+        import math
+        
+        # ガウシアン重みを計算
+        sigma = window_size / 6.0
+        half_window = window_size // 2
+        weights = []
+        for i in range(-half_window, half_window + 1):
+            weight = math.exp(-(i * i) / (2 * sigma * sigma))
+            weights.append(weight)
+        
+        # 重みを正規化
+        weight_sum = sum(weights)
+        weights = [w / weight_sum for w in weights]
+
+        smoothed_positions = list(positions)
+
+        for _ in range(iterations):
+            new_positions = []
+            
+            for i in range(len(smoothed_positions)):
+                if i == 0 or i == len(smoothed_positions) - 1:
+                    # 始点と終点は固定
+                    new_positions.append(smoothed_positions[i])
+                else:
+                    weighted_x = 0.0
+                    weighted_y = 0.0
+                    
+                    for j, weight in enumerate(weights):
+                        idx = i - half_window + j
+                        if 0 <= idx < len(smoothed_positions):
+                            weighted_x += smoothed_positions[idx].x * weight
+                            weighted_y += smoothed_positions[idx].y * weight
+                    
+                    # 元の点との混合
+                    orig_pos = smoothed_positions[i]
+                    new_x = orig_pos.x * (1 - smoothing_factor) + weighted_x * smoothing_factor
+                    new_y = orig_pos.y * (1 - smoothing_factor) + weighted_y * smoothing_factor
+                    
+                    # 障害物チェック
+                    new_pos = Position(new_x, new_y)
+                    grid_pos = self.world_to_grid(new_pos)
+                    if self.is_valid_position(grid_pos):
+                        new_positions.append(new_pos)
+                    else:
+                        new_positions.append(smoothed_positions[i])
+            
+            smoothed_positions = new_positions
+
+        return smoothed_positions
+
+    def _weighted_smooth_positions(self, positions: List[Position],
+                                 iterations: int = 3,
+                                 smoothing_factor: float = 0.8) -> List[Position]:
+        """距離重み付き平滑化"""
+        import math
+        
+        smoothed_positions = list(positions)
+
+        for _ in range(iterations):
+            new_positions = [smoothed_positions[0]]  # スタート点は固定
+
+            for i in range(1, len(smoothed_positions) - 1):
+                curr_pos = smoothed_positions[i]
+                
+                # 前後の点との距離を計算
+                prev_pos = smoothed_positions[i-1]
+                next_pos = smoothed_positions[i+1]
+                
+                prev_dist = curr_pos.distance_to(prev_pos)
+                next_dist = curr_pos.distance_to(next_pos)
+                
+                # 距離の逆数で重み付け
+                if prev_dist > 0 and next_dist > 0:
+                    prev_weight = 1.0 / prev_dist
+                    next_weight = 1.0 / next_dist
+                    total_weight = prev_weight + next_weight + 1.0
+                    
+                    new_x = (curr_pos.x + prev_pos.x * prev_weight + next_pos.x * next_weight) / total_weight
+                    new_y = (curr_pos.y + prev_pos.y * prev_weight + next_pos.y * next_weight) / total_weight
+                    
+                    # 平滑化強度調整
+                    new_x = curr_pos.x * (1 - smoothing_factor) + new_x * smoothing_factor
+                    new_y = curr_pos.y * (1 - smoothing_factor) + new_y * smoothing_factor
+                else:
+                    new_x, new_y = curr_pos.x, curr_pos.y
+
+                # 障害物チェック
+                new_pos = Position(new_x, new_y)
+                grid_pos = self.world_to_grid(new_pos)
+                if self.is_valid_position(grid_pos):
+                    new_positions.append(new_pos)
+                else:
+                    new_positions.append(curr_pos)
+
+            new_positions.append(smoothed_positions[-1])  # ゴール点は固定
+            smoothed_positions = new_positions
+
+        return smoothed_positions
+
+    def _cubic_spline_smooth_positions(self, positions: List[Position],
+                                     smoothing_factor: float = 0.8) -> List[Position]:
+        """3次スプライン補間による平滑化"""
+        import math
+        
+        if len(positions) < 4:
+            return positions
+
+        # パラメータ化（累積距離）
+        distances = [0.0]
+        for i in range(1, len(positions)):
+            dist = positions[i].distance_to(positions[i-1])
+            distances.append(distances[-1] + dist)
+
+        # スプライン補間
+        smoothed_positions = []
+        num_points = max(len(positions), int(distances[-1] / (self.resolution * 2)))
+        
+        for i in range(num_points):
+            t = (distances[-1] * i) / (num_points - 1)
+            
+            # t に対応する区間を見つける
+            segment_idx = 0
+            for j in range(len(distances) - 1):
+                if distances[j] <= t <= distances[j + 1]:
+                    segment_idx = j
+                    break
+            
+            if segment_idx < len(positions) - 1:
+                # 線形補間（簡略版）
+                t_norm = (t - distances[segment_idx]) / (distances[segment_idx + 1] - distances[segment_idx])
+                
+                p0 = positions[segment_idx]
+                p1 = positions[segment_idx + 1]
+                
+                smooth_x = p0.x + (p1.x - p0.x) * t_norm
+                smooth_y = p0.y + (p1.y - p0.y) * t_norm
+                
+                # 元の経路との混合
+                orig_weight = 1 - smoothing_factor
+                if segment_idx < len(positions):
+                    orig_pos = positions[min(segment_idx, len(positions)-1)]
+                    smooth_x = orig_pos.x * orig_weight + smooth_x * smoothing_factor
+                    smooth_y = orig_pos.y * orig_weight + smooth_y * smoothing_factor
+                
+                # 障害物チェック
+                new_pos = Position(smooth_x, smooth_y)
+                grid_pos = self.world_to_grid(new_pos)
+                if self.is_valid_position(grid_pos):
+                    smoothed_positions.append(new_pos)
+                else:
+                    smoothed_positions.append(positions[min(segment_idx, len(positions)-1)])
+
+        return smoothed_positions
+
+    def _simple_smooth_positions(self, positions: List[Position],
+                               iterations: int = 3) -> List[Position]:
+        """単純な平均化フィルタによる平滑化"""
+        smoothed_positions = list(positions)
+
+        for _ in range(iterations):
+            new_positions = [smoothed_positions[0]]  # スタート点は固定
+
+            for i in range(1, len(smoothed_positions) - 1):
+                # 前後の点の平均を取る
+                prev_pos = smoothed_positions[i-1]
+                curr_pos = smoothed_positions[i]
+                next_pos = smoothed_positions[i+1]
+
+                new_x = (prev_pos.x + curr_pos.x + next_pos.x) / 3.0
+                new_y = (prev_pos.y + curr_pos.y + next_pos.y) / 3.0
+
+                # 障害物チェック
+                new_pos = Position(new_x, new_y)
+                grid_pos = self.world_to_grid(new_pos)
+                if self.is_valid_position(grid_pos):
+                    new_positions.append(new_pos)
+                else:
+                    new_positions.append(curr_pos)  # 元の点を使用
+
+            new_positions.append(smoothed_positions[-1])  # ゴール点は固定
+            smoothed_positions = new_positions
+
+        return smoothed_positions
+
+    def optimize_path(self, path: Path, 
+                     enable_shortcuts: bool = True,
+                     enable_smoothing: bool = True,
+                     smoothing_method: str = "gaussian",
+                     max_shortcut_attempts: int = 50) -> Path:
+        """
+        高度な経路最適化（ショートカット検出 + 平滑化）
+        
+        Args:
+            path: 元の経路
+            enable_shortcuts: ショートカット検出の有効/無効
+            enable_smoothing: 平滑化の有効/無効
+            smoothing_method: 平滑化手法
+            max_shortcut_attempts: ショートカット検出の最大試行回数
+            
+        Returns:
+            最適化された経路
+        """
+        optimized_path = path
+        
+        # 1. ショートカット検出による経路短縮
+        if enable_shortcuts:
+            optimized_path = self._detect_shortcuts(optimized_path, max_shortcut_attempts)
+        
+        # 2. 平滑化処理
+        if enable_smoothing:
+            optimized_path = self.smooth_path(optimized_path, smoothing_method=smoothing_method)
+        
+        return optimized_path
+
+    def _detect_shortcuts(self, path: Path, max_attempts: int = 50) -> Path:
+        """
+        ショートカット検出による経路短縮
+        
+        Args:
+            path: 元の経路
+            max_attempts: 最大試行回数
+            
+        Returns:
+            ショートカット処理済みの経路
+        """
+        if len(path.points) <= 2:
+            return path
+        
+        import random
+        
+        positions = [point.position for point in path.points]
+        attempts = 0
+        
+        while attempts < max_attempts:
+            # ランダムに2つの点を選択（離れている点ほど選ばれやすくする）
+            i = random.randint(0, len(positions) - 3)
+            j = random.randint(i + 2, len(positions) - 1)
+            
+            # 直線経路が障害物と干渉しないかチェック
+            if self._is_path_clear(positions[i], positions[j]):
+                # ショートカット可能：中間の点を削除
+                new_positions = positions[:i+1] + positions[j:]
+                
+                # 経路長が短縮されているかチェック
+                if self._calculate_path_length(new_positions) < self._calculate_path_length(positions):
+                    positions = new_positions
+                    # より多くの最適化チャンスを与える
+                    attempts = max(0, attempts - 5)
+            
+            attempts += 1
+        
+        # 最適化されたPathオブジェクトを作成
+        optimized_path = Path()
+        for i, pos in enumerate(positions):
+            if i > 0:
+                cost = pos.distance_to(positions[i-1])
+            else:
+                cost = 0.0
+            optimized_path.add_point(pos, cost)
+        
+        return optimized_path
+
+    def _is_path_clear(self, start_pos: Position, end_pos: Position) -> bool:
+        """
+        2点間の直線経路が障害物と干渉しないかチェック
+        
+        Args:
+            start_pos: 開始位置
+            end_pos: 終了位置
+            
+        Returns:
+            True: 経路がクリア, False: 障害物あり
+        """
+        # ブレゼンハムのライン描画アルゴリズムを使用
+        start_grid = self.world_to_grid(start_pos)
+        end_grid = self.world_to_grid(end_pos)
+        
+        x0, y0 = start_grid
+        x1, y1 = end_grid
+        
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        x, y = x0, y0
+        
+        while True:
+            # 現在のグリッドセルが有効かチェック
+            if not self.is_valid_position((x, y)):
+                return False
+            
+            if x == x1 and y == y1:
+                break
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        
+        return True
+
+    def _calculate_path_length(self, positions: List[Position]) -> float:
+        """経路の総長を計算"""
+        total_length = 0.0
+        for i in range(1, len(positions)):
+            total_length += positions[i].distance_to(positions[i-1])
+        return total_length
